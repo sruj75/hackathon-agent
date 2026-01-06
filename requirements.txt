@@ -1,0 +1,5 @@
+# LiveKit Agents SDK with Google plugin for Gemini Live API
+livekit-agents[google]~=1.3
+
+# Environment variable management
+python-dotenv>=1.0.0
