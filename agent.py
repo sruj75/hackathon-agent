@@ -28,23 +28,20 @@ class CoachAgent(Agent):
             instructions="""You are an AI accountability coach helping users plan their day.
             You have a warm, encouraging personality and help users stay focused on their goals.
             Keep responses conversational and concise since they will be spoken aloud.
-            When asked to test tool calling, use the hello_world tool."""
+            When asked for the password, use the get_password tool."""
         )
         logger.info("CoachAgent initialized with Gemini Live API")
 
-    @agents.tool()
-    async def hello_world(self, name: str) -> str:
+    @agents.function_tool
+    async def get_password(self) -> str:
         """
-        A test tool that greets the user. Use this to verify tool calling works.
+        Retrieves the secret password.
         
-        Args:
-            name: The name to greet
-            
         Returns:
-            A greeting message
+            The secret password string
         """
-        logger.info(f"hello_world tool called with name: {name}")
-        return f"Hello, {name}! 🎉 Tool calling is working perfectly!"
+        logger.info("get_password tool called")
+        return "I SEE DEAD PEOPLE"
 
 
 # ============================================================================
@@ -70,7 +67,7 @@ async def entrypoint(ctx: agents.JobContext):
         logger.info("Creating AgentSession with Gemini Live API (gemini-2.5-flash-native-audio-preview)")
         session = AgentSession(
             llm=google.realtime.RealtimeModel(
-                model="gemini-live-2.5-flash-native-audio",
+                model="gemini-2.0-flash-exp",
                 voice="Puck",  # Gemini voice option
                 temperature=0.8,  # Creativity level (0.0-1.0)
             ),
@@ -108,6 +105,5 @@ if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,  # Pass our entrypoint function
-            name=os.getenv("AGENT_NAME", "intentive-coach"),
         )
     )
