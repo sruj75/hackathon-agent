@@ -64,10 +64,10 @@ async def entrypoint(ctx: agents.JobContext):
         logger.info("Successfully connected to LiveKit room")
         
         # Create agent session with Gemini Live API
-        logger.info("Creating AgentSession with Gemini Live API (gemini-2.5-flash-native-audio-preview)")
+        logger.info("Creating AgentSession with Gemini Live API")
         session = AgentSession(
             llm=google.realtime.RealtimeModel(
-                model="gemini-2.0-flash-exp",
+                model="gemini-2.5-flash-native-audio-preview-12-2025",
                 voice="Puck",  # Gemini voice option
                 temperature=0.8,  # Creativity level (0.0-1.0)
             ),
