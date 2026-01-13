@@ -141,33 +141,41 @@ async def websocket_endpoint(
     async def upstream_task() -> None:
         """Receives messages from WebSocket and sends to LiveRequestQueue."""
         logger.debug("upstream_task started")
-        while True:
-            message = await websocket.receive()
-
-            # Handle binary frames (audio data)
-            if "bytes" in message:
-                audio_data = message["bytes"]
-                logger.debug(f"Received audio chunk: {len(audio_data)} bytes")
-                audio_blob = types.Blob(
-                    mime_type="audio/pcm;rate=16000", data=audio_data
-                )
-                live_request_queue.send_realtime(audio_blob)
-
-            # Handle text frames (JSON messages)
-            elif "text" in message:
-                text_data = message["text"]
-                logger.debug(f"Received text message: {text_data[:100]}...")
+        try:
+            while True:
+                message = await websocket.receive()
                 
-                try:
-                    json_message = json.loads(text_data)
+                # Handle disconnect
+                if message.get("type") == "websocket.disconnect":
+                    logger.info("WebSocket disconnect received in upstream_task")
+                    break
+
+                # Handle binary frames (audio data)
+                if "bytes" in message:
+                    audio_data = message["bytes"]
+                    logger.debug(f"Received audio chunk: {len(audio_data)} bytes")
+                    audio_blob = types.Blob(
+                        mime_type="audio/pcm;rate=16000", data=audio_data
+                    )
+                    live_request_queue.send_realtime(audio_blob)
+
+                # Handle text frames (JSON messages)
+                elif "text" in message:
+                    text_data = message["text"]
+                    logger.debug(f"Received text message: {text_data[:100]}...")
                     
-                    if json_message.get("type") == "text":
-                        content = types.Content(
-                            parts=[types.Part(text=json_message["text"])]
-                        )
-                        live_request_queue.send_content(content)
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON received: {text_data}")
+                    try:
+                        json_message = json.loads(text_data)
+                        
+                        if json_message.get("type") == "text":
+                            content = types.Content(
+                                parts=[types.Part(text=json_message["text"])]
+                            )
+                            live_request_queue.send_content(content)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON received: {text_data}")
+        except Exception as e:
+            logger.debug(f"upstream_task ended: {e}")
 
     async def downstream_task() -> None:
         """Receives Events from run_live() and sends to WebSocket."""

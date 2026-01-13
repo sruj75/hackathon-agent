@@ -45,13 +45,15 @@ Building scrappy in main branch to get Composio + voice agent working for user t
                         │   (WebRTC Room) │
                         └─────────────────┘
 ```
+https://docs.composio.dev/providers/google for wbrtc or use ADK for websockets
+https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api/get-started-sdk 
 
 ### Voice Agent + External Tools
 
 ```
 ┌─────────────────┐     ┌─────────────────────────────────┐
 │   Frontend      │     │         Python Agent            │
-│   (Expo/TS)     │────▶│   ADK + Gemini Live API         │
+│   (Expo/TS)     │────▶│         Gemini Live API         │
 │   WebSocket     │     │   + Domain Layer                │
 └─────────────────┘     │   + Adapters (Composio/etc)     │
                         └─────────────────────────────────┘
@@ -69,10 +71,10 @@ Building scrappy in main branch to get Composio + voice agent working for user t
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         FRONTEND (Expo)                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ Firebase SDK │  │ LiveKit SDK  │  │ Firebase Auth State  │  │
-│  │  (Auth, DB)  │  │   (Voice)    │  │   → Agent Context    │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │ Firebase SDK │  │ LiveKit SDK  │  │ Firebase Auth State  │   │
+│  │  (Auth, DB)  │  │   (Voice)    │  │   → Agent Context    │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘   │
 └─────────┼─────────────────┼─────────────────────┼───────────────┘
           │                 │                     │
           ▼                 ▼                     ▼

@@ -2,3 +2,5 @@ google-adk
 fastapi
 uvicorn[standard]
 python-dotenv
+composio-core
+websockets
