@@ -2,7 +2,7 @@
 
 ## ✅ Completed
 
-### Tools Implemented (19 total)
+### Tools Implemented (18 total)
 
 **Calendar (6):**
 - `list_todays_events` — List today's schedule 
@@ -27,9 +27,6 @@
 - `create_task_list` — Create a new task list
 - `delete_task_list` — Delete a task list
 - `clear_completed_tasks` — Clear completed tasks from a list
-
-**Goals (1):**
-- `get_goal_progress` — Show % completion of goal-linked tasks
 
 ### Composio Dashboard Setup
 - ✅ Google Calendar auth config created (`ac_ku995vgb-hv...`)
@@ -73,6 +70,10 @@ Checking Composio configuration...
    https://backend.composio.dev/api/v3/s/vpCaBv0h
 
 
+questions to think about
+1. mcp endpoint or sdk natie tool definition (composio core)
+2. explicit tools o tool router? (integration style)
+
 **For production (multi-user):**
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -98,26 +99,103 @@ def get_entity_id(user_id: str) -> str:
 
 ---
 
-## 🎨 Generative UI Components (Planned)
+## 🎨 Generative UI Components (3 total)
 
-The agent will be able to "inflate" these UI components on the frontend:
+The agent "inflates" these components for daily planning:
 
-### 1. Day Plan / Schedule
-- `render_day_schedule(events)` — Timeline of today's events
-- `render_free_slots(slots, duration)` — Available time picker
-- `render_event_card(event)` — Single event details
+| Component | Function | Purpose |
+|-----------|----------|---------|
+| `DayView` | `render_day_view(events, tasks)` | Unified timeline: today's schedule + pending tasks |
+| `TodoList` | `render_todo_list(tasks)` | Dedicated Google Tasks visualization |
+| `CalendarView` | `render_calendar_view(events)` | Dedicated Google Calendar visualization |
 
-### 2. Task Management
-- `render_task_list(tasks, filter)` — List with goal-alignment 🎯
-- `render_task_card(task)` — Single task with actions
-- `render_goal_progress(percentage, summary, ...)` — Visual progress bar
+---
 
-### 3. Interventions & Coaching
-- `show_intervention(type, reason, options)` — "You're drifting" nudge
-- `render_action_chooser(actions)` — "Pick one of these next"
-- `render_break_suggestion(duration)` — Suggest taking a break
+## 🧪 Manual Component Testing
 
-### 4. Modals
-- `show_confirmation(title, message)` — "Apply changes?"
-- `show_coach_join()` — Session start modal
+### Developer Tools Menu
 
+A transparent **⋮** button in the top-right corner of the Assistant screen allows manual testing of generative UI components.
+
+**How to Test:**
+1. **Launch the Assistant:** Open the app and navigate to the Assistant screen
+2. **Locate the Menu:** Tap the circular "⋮" button (top-right corner)
+3. **Select a Component:** Choose from the menu:
+   - **Clear UI** — Reset/clear all displayed components
+   - **DAY VIEW** — Inflate unified view with mock events & tasks
+   - **TODO LIST** — Inflate Google Tasks visualization
+   - **CALENDAR VIEW** — Inflate Google Calendar visualization
+4. **Verify UI:** The selected component appears in the main view
+5. **Clear:** Tap "⋮" → "Clear UI" to reset
+
+**Platform Behavior:**
+- **iOS:** Uses native ActionSheet
+- **Android/Web:** Uses Alert dialog
+
+**Mock Data:**
+- Located in `frontend/app/assistant/mockData.ts`
+- Contains realistic sample data for each component
+- Automatically generates timestamps for events
+
+---
+
+## 🏗️ Architecture Decisions
+
+### Current MVP (Jan 2026) - Fully Manual Agent-Driven ✅
+
+**Goal:** Ship fast, trust the AI for MVP, improve reliability post-MVP.
+
+**How it works (AGENT DOES EVERYTHING):**
+1. Agent calls tool to get/modify data (e.g., `calendar_tool("list_today")`)
+2. Agent extracts data from response
+3. Agent calls render tool (e.g., `generative_ui("render_day_view", {events, tasks})`)
+4. Frontend receives function call and displays component
+
+**Why this approach?**
+- **Logical consistency:** If we trust AI to fetch data, we trust it to render UI
+- **Simpler architecture:** No middleware, no callbacks, no auto-triggers
+- **MVP speed:** Fewer moving parts = faster to ship and debug
+
+**The risk:**
+- Agent might forget to render UI (we're testing this assumption)
+- Strong prompt instructions + examples to minimize this
+
+**Implementation:**
+- Agent prompt has "CRITICAL RULE - ALWAYS SHOW UI" with examples
+- Tools return data in responses, agent manually passes to render tools
+- No auto-render infrastructure in use (code kept for post-MVP)
+
+### Post-MVP Plan: Frontend Auto-Fetch (Don't Trust AI)
+
+**When to implement:** If agent forgets to render UI >20% of the time
+
+**Approach:**
+```typescript
+// Frontend auto-fetches baseline data on load
+useEffect(() => {
+  if (connected) {
+    fetchCalendarEvents().then(events => show_calendar_view(events));
+    fetchTasks().then(tasks => show_todo_list(tasks));
+  }
+}, [connected]);
+```
+
+**Benefits:**
+- UI always works (no dependency on agent reliability)
+- Agent becomes optional enhancement (can curate/override)
+- Users see data immediately on app open
+
+**Tradeoffs:**
+- Loses AI curation for initial view
+- More frontend complexity
+- Requires frontend API clients for Google Calendar/Tasks
+
+**Decision point:** Track agent rendering success rate in first 100 sessions.
+
+### Future (Long-term)
+- Proactive agent (shows stuff before you ask)
+- Hundreds of components
+- Multi-agent system
+- Build when we have users & revenue
+
+**Next review:** After 100 sessions or 1 month.

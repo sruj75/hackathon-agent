@@ -188,7 +188,11 @@ async def websocket_endpoint(
         ):
             event_json = event.model_dump_json(exclude_none=True, by_alias=True)
             logger.debug(f"Sending event to client")
-            await websocket.send_text(event_json)
+            try:
+                await websocket.send_text(event_json)
+            except (RuntimeError, WebSocketDisconnect):
+                logger.info("WebSocket connection closed, stopping downstream_task")
+                break
 
     # Run both tasks concurrently
     try:
