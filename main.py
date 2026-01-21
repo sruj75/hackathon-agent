@@ -20,6 +20,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # Import agent after loading env
 from voice_agent.agent import root_agent as agent  # noqa: E402
+from voice_agent.render_ui_tools import set_ui_event_queue, get_ui_event_queue  # noqa: E402
 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -133,6 +134,11 @@ async def websocket_endpoint(
         )
 
     live_request_queue = LiveRequestQueue()
+    
+    # Create UI event queue for this connection
+    ui_event_queue = asyncio.Queue()
+    set_ui_event_queue(ui_event_queue)
+    logger.info("UI event queue created for this connection")
 
     # ========================================
     # Bidirectional Streaming Tasks
@@ -186,6 +192,40 @@ async def websocket_endpoint(
             live_request_queue=live_request_queue,
             run_config=run_config,
         ):
+            # Log every event with content
+            if event.content and event.content.parts:
+                for i, part in enumerate(event.content.parts):
+                    # Log what attributes this part has
+                    part_attrs = [a for a in ['text', 'function_call', 'function_response', 'inline_data'] if getattr(part, a, None) is not None]
+                    if part_attrs:
+                        logger.info(f"[MAIN-EVENT] Part {i} has: {part_attrs}")
+                    
+                    # Check for function_response in the part
+                    func_resp = getattr(part, 'function_response', None)
+                    if func_resp is not None:
+                        func_name = getattr(func_resp, 'name', 'unknown')
+                        response_data = getattr(func_resp, 'response', None)
+                        
+                        logger.info(f"[MAIN-UI] Found function_response: {func_name}")
+                        
+                        if func_name == 'generative_ui' and isinstance(response_data, dict):
+                            ui_payload = response_data.get("ui_payload")
+                            if ui_payload:
+                                logger.info(f"[MAIN-UI] >>> Detected ui_payload: component={ui_payload.get('type', 'unknown')}")
+                                
+                                # Emit custom generative_ui event to frontend
+                                ui_event = {
+                                    "type": "generative_ui",
+                                    "component": ui_payload.get("type"),
+                                    "props": ui_payload.get("props", {})
+                                }
+                                try:
+                                    await websocket.send_text(json.dumps(ui_event))
+                                    logger.info(f"[MAIN-UI] <<< SENT generative_ui WebSocket event: {ui_payload.get('type')}")
+                                except (RuntimeError, WebSocketDisconnect):
+                                    logger.warning("[MAIN-UI] WebSocket closed while sending UI event")
+            
+            # Send original event to client as well
             event_json = event.model_dump_json(exclude_none=True, by_alias=True)
             logger.debug(f"Sending event to client")
             try:
@@ -194,9 +234,32 @@ async def websocket_endpoint(
                 logger.info("WebSocket connection closed, stopping downstream_task")
                 break
 
-    # Run both tasks concurrently
+    async def ui_event_task() -> None:
+        """Reads UI events from queue and sends to WebSocket."""
+        logger.info("ui_event_task started")
+        while True:
+            try:
+                # Wait for UI event with timeout to allow checking for disconnect
+                ui_event = await asyncio.wait_for(ui_event_queue.get(), timeout=1.0)
+                logger.info(f"[UI-TASK] Got UI event from queue: {ui_event.get('component')}")
+                try:
+                    await websocket.send_text(json.dumps(ui_event))
+                    logger.info(f"[UI-TASK] <<< SENT generative_ui WebSocket event: {ui_event.get('component')}")
+                except (RuntimeError, WebSocketDisconnect):
+                    logger.info("WebSocket closed, stopping ui_event_task")
+                    break
+            except asyncio.TimeoutError:
+                # Check if we should stop
+                if websocket.client_state.name != "CONNECTED":
+                    logger.info("WebSocket no longer connected, stopping ui_event_task")
+                    break
+            except Exception as e:
+                logger.error(f"Error in ui_event_task: {e}")
+                break
+
+    # Run all three tasks concurrently
     try:
-        await asyncio.gather(upstream_task(), downstream_task())
+        await asyncio.gather(upstream_task(), downstream_task(), ui_event_task())
     except WebSocketDisconnect:
         logger.info("Client disconnected")
     except Exception as e:
@@ -204,6 +267,7 @@ async def websocket_endpoint(
     finally:
         logger.info("Closing live_request_queue")
         live_request_queue.close()
+        set_ui_event_queue(None)  # Clear the queue reference
 
 
 # ========================================

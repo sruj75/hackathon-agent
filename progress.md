@@ -141,7 +141,7 @@ A transparent **⋮** button in the top-right corner of the Assistant screen all
 
 ## 🏗️ Architecture Decisions
 
-### Current MVP (Jan 2026) - Fully Manual Agent-Driven ✅
+### Current MVP (Jan 2026) - Fully Agent-Driven ✅
 
 **Goal:** Ship fast, trust the AI for MVP, improve reliability post-MVP.
 
@@ -163,34 +163,8 @@ A transparent **⋮** button in the top-right corner of the Assistant screen all
 **Implementation:**
 - Agent prompt has "CRITICAL RULE - ALWAYS SHOW UI" with examples
 - Tools return data in responses, agent manually passes to render tools
-- No auto-render infrastructure in use (code kept for post-MVP)
+- No auto-render infrastructure
 
-### Post-MVP Plan: Frontend Auto-Fetch (Don't Trust AI)
-
-**When to implement:** If agent forgets to render UI >20% of the time
-
-**Approach:**
-```typescript
-// Frontend auto-fetches baseline data on load
-useEffect(() => {
-  if (connected) {
-    fetchCalendarEvents().then(events => show_calendar_view(events));
-    fetchTasks().then(tasks => show_todo_list(tasks));
-  }
-}, [connected]);
-```
-
-**Benefits:**
-- UI always works (no dependency on agent reliability)
-- Agent becomes optional enhancement (can curate/override)
-- Users see data immediately on app open
-
-**Tradeoffs:**
-- Loses AI curation for initial view
-- More frontend complexity
-- Requires frontend API clients for Google Calendar/Tasks
-
-**Decision point:** Track agent rendering success rate in first 100 sessions.
 
 ### Future (Long-term)
 - Proactive agent (shows stuff before you ask)

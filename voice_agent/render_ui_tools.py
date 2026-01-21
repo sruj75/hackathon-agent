@@ -1,45 +1,43 @@
 """
-Generative UI Tool - HYBRID APPROACH
+Generative UI Tool - Explicit UI Rendering
 
-This tool gives the agent EXPLICIT CONTROL over UI rendering.
+This tool allows the agent to explicitly show UI components to the user.
 
-HYBRID BEHAVIOR:
-- calendar_tool and tasks_tool auto-return ui_payload (render_mode: "auto")
-- Use THIS tool to OVERRIDE auto-renders (render_mode: "explicit")
-
-PRIORITY SYSTEM (when multiple tool calls happen):
-- Explicit UI (from this tool) > Auto UI (from calendar/tasks)
-- Within auto: day_view (3) > todo_list (2) > calendar_view (1)
-- Frontend shows only the HIGHEST priority UI at end of agent's turn
-
-USE THIS TOOL FOR:
-1. OVERRIDING auto-renders when you want specific presentation
-2. Forcing unified day_view when you called both calendar + tasks tools
-3. Forcing specific view (tasks-only or calendar-only) despite what tools returned
+The agent has full control over when and what UI to display.
+There is no auto-rendering - the agent must call this tool to show UI.
 """
 import logging
+import asyncio
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Global queue for UI events - main.py will read from this
+_ui_event_queue: Optional[asyncio.Queue] = None
 
-def generative_ui(component: str, props: dict = None, force_render: bool = False) -> dict:
+def set_ui_event_queue(queue: asyncio.Queue):
+    """Set the queue that UI events will be sent to."""
+    global _ui_event_queue
+    _ui_event_queue = queue
+    logger.info("[GENERATIVE_UI] UI event queue registered")
+
+def get_ui_event_queue() -> Optional[asyncio.Queue]:
+    """Get the current UI event queue."""
+    return _ui_event_queue
+
+
+def generative_ui(component: str, props = None):
     """
-    Explicit UI control for agent - OVERRIDE auto-renders.
+    Render a UI component to the user.
     
-    COMPONENTS (must match frontend):
+    Components:
     - day_view: Unified view (tasks + events together)
     - todo_list: Task list only
     - calendar_view: Calendar only
     
-    USE THIS TO:
-    - Override auto-renders from calendar_tool/tasks_tool
-    - Force specific UI when multiple tools called
-    - Control presentation explicitly
-    
     Args:
         component: Component type (day_view, todo_list, calendar_view)
-        props: Component properties (leave empty {} - frontend fetches latest data)
-        force_render: If True, immediately renders without waiting for turn end
+        props: Component properties with data to display
         
     Returns:
         {
@@ -47,10 +45,7 @@ def generative_ui(component: str, props: dict = None, force_render: bool = False
             "message": str,
             "ui_payload": {
                 "type": component,
-                "props": props,
-                "render_mode": "explicit",
-                "priority": 100,  # Always wins over auto-renders
-                "force_render": bool
+                "props": props
             }
         }
     """
@@ -62,23 +57,37 @@ def generative_ui(component: str, props: dict = None, force_render: bool = False
     ]
     
     if component not in valid_components:
-        logger.warning(f"Generative UI: Unknown component '{component}'")
+        logger.warning(f"[GENERATIVE_UI] !!! Unknown component '{component}' - valid: {valid_components}")
         return {
             "success": False,
             "message": f"Unknown component: {component}. Valid: {', '.join(valid_components)}",
             "ui_payload": None
         }
     
-    logger.info(f"Generative UI (EXPLICIT): {component}, force={force_render}")
+    # Log props summary (avoid logging huge data)
+    props_keys = list(props.keys()) if props else []
+    logger.info(f"[GENERATIVE_UI] >>> component={component}, props_keys={props_keys}")
+    
+    # Push UI event to queue for main.py to send via WebSocket
+    if _ui_event_queue is not None:
+        ui_event = {
+            "type": "generative_ui",
+            "component": component,
+            "props": props
+        }
+        try:
+            _ui_event_queue.put_nowait(ui_event)
+            logger.info(f"[GENERATIVE_UI] <<< Queued UI event: {component}")
+        except Exception as e:
+            logger.error(f"[GENERATIVE_UI] Failed to queue UI event: {e}")
+    else:
+        logger.warning("[GENERATIVE_UI] No UI event queue registered - UI won't render!")
     
     return {
         "success": True,
-        "message": f"Rendering {component} (explicit)",
+        "message": f"Rendering {component}",
         "ui_payload": {
             "type": component,
-            "props": props,
-            "render_mode": "explicit",
-            "priority": 100,  # Explicit always wins
-            "force_render": force_render
+            "props": props
         }
     }
