@@ -3,21 +3,23 @@ Composio tools for Google Calendar and Tasks.
 Scrappy implementation - no fancy abstractions.
 """
 import os
+from dotenv import load_dotenv
 from composio import Composio, Action
 from datetime import datetime, timedelta
 import logging
+
+# Ensure .env is loaded regardless of import order (safe to call multiple times)
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # Use default entity (your connected account)
 ENTITY_ID = "default"
 
-# Timezone configuration - defaults to UTC if not set
-TIMEZONE = os.getenv("TIMEZONE", "UTC")
-
 # Lazy initialization - client created on first use (after .env is loaded by ADK)
 _composio_client = None
 _entity = None
+_user_timezone = None  # Cached timezone from Google Calendar
 
 
 def _get_entity():
@@ -36,6 +38,38 @@ def _get_entity():
         logger.info("Composio entity initialized successfully")
     
     return _entity
+
+
+def _get_user_timezone() -> str:
+    """
+    Get timezone from user's Google Calendar settings.
+    Cached after first fetch to avoid repeated API calls.
+    Falls back to UTC if fetch fails.
+    """
+    global _user_timezone
+    
+    if _user_timezone is not None:
+        return _user_timezone
+    
+    try:
+        entity = _get_entity()
+        result = entity.execute(
+            action=Action.GOOGLECALENDAR_GET_CALENDAR,
+            params={"calendar_id": "primary"}
+        )
+        
+        # Extract timezone from calendar settings
+        data = result.get("data", result)
+        timezone = data.get("timeZone", "UTC")
+        
+        _user_timezone = timezone
+        logger.info(f"Fetched user timezone from Google Calendar: {timezone}")
+        return timezone
+        
+    except Exception as e:
+        logger.warning(f"Failed to fetch timezone from Google Calendar: {e}. Using UTC as fallback.")
+        _user_timezone = "UTC"
+        return "UTC"
 
 
 # ========================================
@@ -58,7 +92,7 @@ def list_todays_events() -> dict:
                 "calendar_id": "primary",
                 "time_min": f"{today}T00:00:00",
                 "time_max": f"{today}T23:59:59",
-                "timezone": TIMEZONE,
+                "timezone": _get_user_timezone(),
                 "single_events": True,
                 "order_by": "startTime"
             }
@@ -144,7 +178,7 @@ def create_calendar_event(title: str, start_time: str, duration_minutes: int = 6
             params={
                 "summary": title,
                 "start_datetime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timezone": TIMEZONE,
+                "timezone": _get_user_timezone(),
                 "event_duration_hour": duration_hours,
                 "event_duration_minutes": duration_mins,
                 "description": description,
@@ -445,12 +479,12 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
             else:
                 start_dt = datetime.fromisoformat(new_start_time.replace("Z", ""))
             
-            patch_params["start"] = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
+            patch_params["start"] = {"dateTime": start_dt.isoformat(), "timeZone": _get_user_timezone()}
             
             # Calculate end time
             duration = new_duration_minutes or 60
             end_dt = start_dt + timedelta(minutes=duration)
-            patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE}
+            patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": _get_user_timezone()}
             
             final_start = start_dt.isoformat()
             final_end = end_dt.isoformat()
@@ -460,7 +494,7 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
             if existing_start:
                 start_dt = datetime.fromisoformat(existing_start.replace("Z", ""))
                 end_dt = start_dt + timedelta(minutes=new_duration_minutes)
-                patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE}
+                patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": _get_user_timezone()}
                 final_end = end_dt.isoformat()
         
         # Execute the patch
@@ -506,6 +540,49 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
 # TASKS TOOLS
 # ========================================
 
+def _fetch_all_tasks(show_completed: bool = False) -> list:
+    """Helper to fetch tasks from ALL task lists."""
+    try:
+        # 1. Get all task lists
+        lists_result = _get_entity().execute(
+            action=Action.GOOGLETASKS_LIST_TASK_LISTS,
+            params={}
+        )
+        lists_data = lists_result.get("data", lists_result)
+        task_lists = lists_data.get("items", [])
+        
+        if not task_lists:
+            return []
+            
+        all_tasks = []
+        
+        # 2. Iterate each list
+        for tl in task_lists:
+            list_id = tl.get("id")
+            
+            try:
+                tasks_result = _get_entity().execute(
+                    action=Action.GOOGLETASKS_LIST_TASKS,
+                    params={"tasklist_id": list_id, "showCompleted": show_completed}
+                )
+                t_data = tasks_result.get("data", tasks_result)
+                # Handle both 'items' and 'tasks' keys
+                tasks = t_data.get("items", t_data.get("tasks", []))
+                
+                # Add list context to tasks
+                if tasks:
+                    for t in tasks:
+                        t["tasklist_id"] = list_id
+                        all_tasks.append(t)
+            except Exception as inner_e:
+                logger.warning(f"Failed to fetch tasks for list {list_id}: {inner_e}")
+                continue
+                
+        return all_tasks
+    except Exception as e:
+        logger.error(f"Error fetching all tasks: {e}")
+        return []
+
 def list_all_tasks() -> dict:
     """
     Lists all incomplete tasks across all task lists.
@@ -514,12 +591,7 @@ def list_all_tasks() -> dict:
         Structured dict with tasks data and message.
     """
     try:
-        result = _get_entity().execute(
-            action=Action.GOOGLETASKS_LIST_TASKS,
-            params={"showCompleted": False}
-        )
-        
-        raw_tasks = result.get("tasks", [])
+        raw_tasks = _fetch_all_tasks(show_completed=False)
         
         # Transform to frontend format
         tasks = []
@@ -537,7 +609,8 @@ def list_all_tasks() -> dict:
                 "notes": clean_notes,
                 "due": task.get("due", ""),
                 "status": "pending",
-                "is_goal_linked": is_goal_linked
+                "is_goal_linked": is_goal_linked,
+                "tasklist_id": task.get("tasklist_id", "")
             })
             
             if is_goal_linked:
@@ -586,7 +659,8 @@ def add_task(title: str, linked_to_goal: bool = False, notes: str = "") -> dict:
             params={}
         )
         
-        task_lists = lists_result.get("items", [])
+        data = lists_result.get("data", lists_result)
+        task_lists = data.get("items", [])
         if not task_lists:
             return {
                 "success": False,
@@ -612,7 +686,8 @@ def add_task(title: str, linked_to_goal: bool = False, notes: str = "") -> dict:
         
         # Extract task data from result
         task_data = result.get("data", result)
-        task_id = task_data.get("id", "")
+        actual_task = task_data.get("task", task_data)
+        task_id = actual_task.get("id", "")
         
         created_task = {
             "id": task_id,
@@ -651,12 +726,8 @@ def complete_task(task_title: str) -> dict:
     """
     try:
         # Get all tasks to find the matching one
-        result = _get_entity().execute(
-            action=Action.GOOGLETASKS_LIST_TASKS,
-            params={"showCompleted": False}
-        )
+        tasks = _fetch_all_tasks(show_completed=False)
         
-        tasks = result.get("tasks", [])
         matching = None
         for task in tasks:
             if task_title.lower() in task.get("title", "").lower():
@@ -720,12 +791,8 @@ def delete_task(task_title: str) -> dict:
     """
     try:
         # Get all tasks to find the matching one
-        result = _get_entity().execute(
-            action=Action.GOOGLETASKS_LIST_TASKS,
-            params={"showCompleted": False}
-        )
+        tasks = _fetch_all_tasks(show_completed=False)
         
-        tasks = result.get("tasks", [])
         matching = None
         for task in tasks:
             if task_title.lower() in task.get("title", "").lower():
@@ -780,12 +847,8 @@ def modify_task(task_title: str, new_title: str = None, new_notes: str = None,
     """
     try:
         # Get all tasks to find the matching one
-        result = _get_entity().execute(
-            action=Action.GOOGLETASKS_LIST_TASKS,
-            params={"showCompleted": False}
-        )
+        tasks = _fetch_all_tasks(show_completed=False)
         
-        tasks = result.get("tasks", [])
         matching = None
         for task in tasks:
             if task_title.lower() in task.get("title", "").lower():
@@ -1039,13 +1102,8 @@ def get_task(task_title: str) -> dict:
     """
     try:
         # Use list all tasks to find across all lists
-        result = _get_entity().execute(
-            action=Action.GOOGLETASKS_LIST_ALL_TASKS,
-            params={"showCompleted": True}
-        )
+        tasks = _fetch_all_tasks(show_completed=True)
         
-        data = result.get("data", result)
-        tasks = data.get("tasks", data.get("items", []))
         matching = None
         for task in tasks:
             if task_title.lower() in task.get("title", "").lower():
@@ -1131,13 +1189,8 @@ def move_task(task_title: str, to_list_name: str) -> dict:
             }
         
         # Find the task
-        tasks_result = _get_entity().execute(
-            action=Action.GOOGLETASKS_LIST_ALL_TASKS,
-            params={"showCompleted": False}
-        )
+        tasks = _fetch_all_tasks(show_completed=False)
         
-        data = tasks_result.get("data", tasks_result)
-        tasks = data.get("tasks", data.get("items", []))
         matching = None
         for task in tasks:
             if task_title.lower() in task.get("title", "").lower():
@@ -1403,4 +1456,3 @@ def tasks_tool(operation: str, params = None):
     
     logger.info(f"[TASKS_TOOL] <<< success={result.get('success')}, has_data={'data' in result}")
     return result
-
