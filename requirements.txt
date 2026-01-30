@@ -1,7 +1,13 @@
-google-adk
 fastapi
-uvicorn[standard]
+uvicorn
 python-dotenv
+google-genai
+google-adk
 composio-core
 websockets
-pytz
+apscheduler>=3.10.0
+pytz>=2024.1
+aiosqlite>=0.19.0
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+greenlet==3.3.1

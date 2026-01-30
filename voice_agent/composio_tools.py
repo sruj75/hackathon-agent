@@ -61,7 +61,12 @@ def _get_user_timezone() -> str:
         
         # Extract timezone from calendar settings
         data = result.get("data", result)
-        timezone = data.get("timeZone", "UTC")
+        
+        # Handle nested structure from Composio (data -> calendar_data -> timeZone)
+        if "calendar_data" in data:
+            timezone = data["calendar_data"].get("timeZone", "UTC")
+        else:
+            timezone = data.get("timeZone", "UTC")
         
         _user_timezone = timezone
         logger.info(f"Fetched user timezone from Google Calendar: {timezone}")

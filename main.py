@@ -19,15 +19,20 @@ from fastapi.middleware.cors import CORSMiddleware
 # Load environment variables BEFORE importing agent
 load_dotenv(Path(__file__).parent / ".env")
 
+# Add the current directory (agent/) to sys.path so that absolute imports work correctly
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+
 # Import agent after loading env
 from voice_agent.agent import root_agent as agent  # noqa: E402
 from voice_agent.render_ui_tools import set_ui_event_queue, get_ui_event_queue  # noqa: E402
 
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
+from session_manager import ADKSessionManager
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.genai import types
+from context import current_session_id, current_user_id
 
 # Configure logging
 logging.basicConfig(
@@ -62,8 +67,9 @@ app.add_middleware(
 )
 
 # Session and Runner setup
-session_service = InMemorySessionService()
-runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_service)
+# Session and Runner setup
+session_manager = ADKSessionManager()
+runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_manager.service)
 
 
 # ========================================
@@ -100,6 +106,10 @@ async def websocket_endpoint(
     await websocket.accept()
     logger.info("WebSocket connection accepted")
 
+    # Set context variables for this request/connection
+    current_user_id.set(user_id)
+    current_session_id.set(session_id)
+
     # ========================================
     # Session Initialization
     # ========================================
@@ -126,13 +136,9 @@ async def websocket_endpoint(
         logger.info(f"Using TEXT response modality for model: {model_name}")
 
     # Get or create session
-    session = await session_service.get_session(
+    session = await session_manager.get_or_create_session(
         app_name=APP_NAME, user_id=user_id, session_id=session_id
     )
-    if not session:
-        await session_service.create_session(
-            app_name=APP_NAME, user_id=user_id, session_id=session_id
-        )
 
     live_request_queue = LiveRequestQueue()
     
@@ -241,6 +247,16 @@ async def websocket_endpoint(
             except (RuntimeError, WebSocketDisconnect):
                 logger.info("WebSocket connection closed, stopping downstream_task")
                 break
+            
+            # Persist state after significant events
+            # For robustness in v0, try saving periodically or after each event batch
+            # Note: session object is the one we got from get_or_create_session
+            try:
+                # We save on every event for now to ensure we capture state changes.
+                # In production, debouncing or checking event type is better.
+                await session_manager.save_agent_session_to_db(session_id, session.state, user_id=user_id)
+            except Exception as e:
+                logger.warning(f"Failed to persist session state: {e}")
 
     async def ui_event_task() -> None:
         """Reads UI events from queue and sends to WebSocket."""

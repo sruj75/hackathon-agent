@@ -111,34 +111,6 @@ The agent "inflates" these components for daily planning:
 
 ---
 
-## 🧪 Manual Component Testing
-
-### Developer Tools Menu
-
-A transparent **⋮** button in the top-right corner of the Assistant screen allows manual testing of generative UI components.
-
-**How to Test:**
-1. **Launch the Assistant:** Open the app and navigate to the Assistant screen
-2. **Locate the Menu:** Tap the circular "⋮" button (top-right corner)
-3. **Select a Component:** Choose from the menu:
-   - **Clear UI** — Reset/clear all displayed components
-   - **DAY VIEW** — Inflate unified view with mock events & tasks
-   - **TODO LIST** — Inflate Google Tasks visualization
-   - **CALENDAR VIEW** — Inflate Google Calendar visualization
-4. **Verify UI:** The selected component appears in the main view
-5. **Clear:** Tap "⋮" → "Clear UI" to reset
-
-**Platform Behavior:**
-- **iOS:** Uses native ActionSheet
-- **Android/Web:** Uses Alert dialog
-
-**Mock Data:**
-- Located in `frontend/app/assistant/mockData.ts`
-- Contains realistic sample data for each component
-- Automatically generates timestamps for events
-
----
-
 ## 🏗️ Architecture Decisions
 
 ### Current MVP (Jan 2026) - Fully Agent-Driven ✅
