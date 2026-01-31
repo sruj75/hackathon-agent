@@ -24,7 +24,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Import agent after loading env
-from voice_agent.agent import root_agent as agent  # noqa: E402
+from voice_agent.agent import conversation_agent as agent  # noqa: E402
 from voice_agent.render_ui_tools import set_ui_event_queue, get_ui_event_queue  # noqa: E402
 
 from google.adk.runners import Runner
@@ -33,6 +33,16 @@ from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.genai import types
 from context import current_session_id, current_user_id
+
+# New imports for Cron Endpoints
+from fastapi import Header, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from database import get_db, SessionLocal
+from repos import event_repo, user_repo
+from event_handlers import handle_event
+from datetime import datetime, timedelta, time
+import os
+from agent_runtime import AgentRuntime
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +56,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # Application name constant
 APP_NAME = "intentive-coach"
+
+CRON_API_KEY = os.getenv("CRON_API_KEY", "dev-secret-key")  # Set in production
 
 # ========================================
 # FastAPI App Setup
@@ -88,6 +100,144 @@ async def health():
     return {"status": "healthy"}
 
 
+# ========================================
+# Cron Endpoints
+# ========================================
+
+@app.get("/api/check-pending")
+async def check_pending_events(
+    db: AsyncSession = Depends(get_db),
+    x_cron_secret: str = Header(None)
+):
+    """Called by external cron every 1-5 minutes."""
+    if x_cron_secret != CRON_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    events = await event_repo.get_pending_events(db, before_time=datetime.now())
+    return {"pending": [e.id for e in events]}
+
+@app.post("/api/execute-event/{event_id}")
+async def execute_event(
+    event_id: str,
+    db: AsyncSession = Depends(get_db),
+    x_cron_secret: str = Header(None)
+):
+    """Execute a specific scheduled event."""
+    if x_cron_secret != CRON_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    event = await event_repo.get_by_id(db, event_id)
+    
+    # Null check: if event doesn't exist, return 404
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Agent Logic (Hybrid Architecture)
+    # UNIFIED ARCHITECTURE: Thinking Mode (Standard API) via AgentRuntime
+    
+# ========================================
+# Agent Logic: Thinking Mode (Text)
+# ========================================
+    
+    # 1. Trigger Prompt
+    trigger_prompt = (
+        f"SYSTEM_TRIGGER: The timer for event '{event.event_type}' has ended. "
+        f"Context: {event.payload}. "
+        "Decide if you need to alert the user using `send_push_notification`."
+    )
+    
+    # 2. Run Turn via AgentRuntime
+    logger.info(f"--- Calling AgentRuntime.run_thinking_mode for user {event.user_id} ---")
+    try:
+        async for agent_event in AgentRuntime.run_thinking_mode(
+            user_id=event.user_id,
+            trigger_context=trigger_prompt,
+            session_manager=session_manager
+        ):
+            # Log significant events
+            if hasattr(agent_event, "content") and agent_event.content and agent_event.content.parts:
+                for part in agent_event.content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                         logger.info(f"🤖 [THINKING] Tool Call: {part.function_call.name}")
+                    if hasattr(part, "text") and part.text:
+                         logger.info(f"🤖 [THINKING] Agent response: {part.text}")
+        
+    except Exception as e:
+        logger.error(f"❌ [THINKING] Agent failed to run: {e}")
+        # Don't re-raise, we still want to mark event as executed so we don't loop forever
+    
+    await event_repo.mark_executed(db, event_id)
+    return {"status": "executed", "agent_response": "processed"}
+
+@app.post("/api/save-token")
+async def save_push_token(
+    payload: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Saves the user's Expo push token.
+    Payload expected: {"user_id": "...", "token": "..."}
+    """
+    user_id = payload.get("user_id")
+    token = payload.get("token")
+    
+    if not user_id or not token:
+        raise HTTPException(status_code=400, detail="Missing user_id or token")
+        
+    await user_repo.save_push_token(db, user_id, token)
+    return {"status": "saved", "user_id": user_id}
+
+
+@app.on_event("startup")
+async def schedule_morning_wakes():
+    """
+    Heartbeat Logic:
+    On server startup, ensure every user has a morning_wake event scheduled for tomorrow.
+    This guarantees the 'Agent Loop' restarts even if the server crashed overnight.
+    Idempotent: Checks for existence before creating.
+    """
+    logger.info("🌅 [STARTUP] Checking morning wake schedules...")
+    async with SessionLocal() as db:
+        users = await user_repo.get_all_users(db)
+        count = 0
+        for user in users:
+            # Logic: Schedule for TOMORROW morning
+            tomorrow = (datetime.now() + timedelta(days=1)).date()
+            
+            # Default to 08:00 if user has no preference
+            wake_fmt = user.wake_time or "08:00"
+            try:
+                wake_time_obj = time.fromisoformat(wake_fmt)
+            except ValueError:
+                wake_time_obj = time(8, 0) # Fallback safe default
+                
+            # Combine into naive datetime (repo handles storage)
+            wake_dt = datetime.combine(tomorrow, wake_time_obj)
+            
+            # Check if exists (Idempotency)
+            existing = await event_repo.get_event_by_type_and_time(
+                db, user.user_id, "morning_wake", wake_dt
+            )
+            
+            if not existing:
+                await event_repo.create_event(
+                    db, 
+                    user.user_id, 
+                    wake_dt, 
+                    "morning_wake", 
+                    payload={
+                        "title": "Good Morning! ☀️",
+                        "body": "Time to design your day. Ready to start?"
+                    }
+                )
+                count += 1
+                logger.info(f"   ✅ Scheduled wake for {user.user_id} at {wake_dt}")
+            else:
+                logger.info(f"   Note: Wake already scheduled for {user.user_id}")
+                
+        logger.info(f"🌅 [STARTUP] Complete. Scheduled {count} new wake events.")
+
+
 @app.websocket("/ws/{user_id}/{session_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -106,38 +256,28 @@ async def websocket_endpoint(
     await websocket.accept()
     logger.info("WebSocket connection accepted")
 
+    # Override session_id with the deterministic daily ID
+    # This aligns the WebSocket connection with the same session used by cron/background agent.
+    # We ignore the client-provided session_id (which is often random or stale).
+    unified_session_id = ADKSessionManager.get_daily_session_id(user_id)
+    logger.info(f"Map WebSocket connection to Unified Session ID: {unified_session_id}")
+
     # Set context variables for this request/connection
     current_user_id.set(user_id)
-    current_session_id.set(session_id)
+    current_session_id.set(unified_session_id)
 
     # ========================================
     # Session Initialization
     # ========================================
     
-    # Determine response modality based on model
-    model_name = agent.model
-    is_native_audio = "native-audio" in model_name.lower() or "live" in model_name.lower()
-    
-    if is_native_audio:
-        response_modalities = ["AUDIO"]
-        run_config = RunConfig(
-            streaming_mode=StreamingMode.BIDI,
-            response_modalities=response_modalities,
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-        )
-        logger.info(f"Using AUDIO response modality for model: {model_name}")
-    else:
-        response_modalities = ["TEXT"]
-        run_config = RunConfig(
-            streaming_mode=StreamingMode.BIDI,
-            response_modalities=response_modalities,
-        )
-        logger.info(f"Using TEXT response modality for model: {model_name}")
+    # Determine response modality based on Conversation Mode (Live API)
+    # Conversation Mode: Audio/Video
+    run_config = AgentRuntime.get_conversation_mode_config()
+    logger.info(f"Using Conversation Mode (AUDIO) for session: {unified_session_id}")
 
     # Get or create session
     session = await session_manager.get_or_create_session(
-        app_name=APP_NAME, user_id=user_id, session_id=session_id
+        app_name=APP_NAME, user_id=user_id, session_id=unified_session_id
     )
 
     live_request_queue = LiveRequestQueue()
@@ -202,7 +342,7 @@ async def websocket_endpoint(
         logger.debug("downstream_task started")
         async for event in runner.run_live(
             user_id=user_id,
-            session_id=session_id,
+            session_id=unified_session_id,
             live_request_queue=live_request_queue,
             run_config=run_config,
         ):
@@ -254,7 +394,7 @@ async def websocket_endpoint(
             try:
                 # We save on every event for now to ensure we capture state changes.
                 # In production, debouncing or checking event type is better.
-                await session_manager.save_agent_session_to_db(session_id, session.state, user_id=user_id)
+                await session_manager.save_agent_session_to_db(unified_session_id, session.state, user_id=user_id)
             except Exception as e:
                 logger.warning(f"Failed to persist session state: {e}")
 

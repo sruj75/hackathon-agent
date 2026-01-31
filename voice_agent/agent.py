@@ -5,15 +5,26 @@ AI Accountability Coach Agent - Consolidated Architecture
 from google.adk.agents import Agent
 from .composio_tools import calendar_tool, tasks_tool
 from .render_ui_tools import generative_ui
+from .notification_tools import send_push_notification_tool
 import logging
 
 logger = logging.getLogger(__name__)
 
-root_agent = Agent(
-    name="intentive_planner",
-    model="gemini-2.5-flash-native-audio-preview-09-2025",
-    description="Voice-first daily planner that unifies tasks and calendar.",
-    instruction="""You are a voice-first daily planner assistant. You help users plan their day by managing tasks and calendar events as a unified workflow.
+# Models
+# Conversation Mode: Gemini 2.5 Flash (Live API / Audio)
+CONVERSATION_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
+# Thinking Mode: Gemini 3 Flash (Standard API / Text)
+THINKING_MODEL = "gemini-3-flash-preview"  # User confirmed correct model
+
+AGENT_NAME = "intentive_planner"
+AGENT_DESCRIPTION = "Voice-first daily planner that unifies tasks and calendar."
+AGENT_INSTRUCTION = """You are a voice-first daily planner assistant. You help users plan their day by managing tasks and calendar events as a unified workflow.
+
+SYSTEM_EVENTS:
+If the user's message is a "SYSTEM_TRIGGER" (e.g., a timer ended), your goal is to:
+1. Understand the context (what timer ended?)
+2. Decide if you need to alert the user.
+3. If yes, use `send_push_notification` with a relevant message.
 
 PERSONALITY:
 - Efficient, clear, and helpful
@@ -65,6 +76,9 @@ YOUR TOOLS (3):
    - "day_view": Show unified view (params: events, tasks)
    - "todo_list": Show task list (params: tasks)
    - "calendar_view": Show calendar (params: events)
+
+4. send_push_notification_tool(title, body) - Send push notification
+   - "send_push_notification": Send alert (params: title, body)
 
 RENDERING WORKFLOW (MANDATORY):
 
@@ -131,12 +145,39 @@ ERROR HANDLING:
 
 Be efficient. Speak less, SHOW MORE (automatically).
 Safety: 100%
-Responsiveness: 100%""",
-    tools=[
-        calendar_tool,
-        tasks_tool,
-        generative_ui,
-    ],
+Responsiveness: 100%"""
+
+AGENT_TOOLS = [
+    calendar_tool,
+    tasks_tool,
+    generative_ui,
+    send_push_notification_tool,
+]
+
+# ---------------------------------------------------------
+# Agent Instances (Unified Architecture)
+# ---------------------------------------------------------
+
+# Thinking Mode: TEXT based model for background turns
+thinking_agent = Agent(
+    name=AGENT_NAME,
+    model=THINKING_MODEL,
+    description=AGENT_DESCRIPTION,
+    instruction=AGENT_INSTRUCTION,
+    tools=AGENT_TOOLS
 )
 
-logger.info("Intentive Planner initialized with 3 tools: calendar_tool, tasks_tool, generative_ui")
+# Conversation Mode: AUDIO based model for real-time voice
+conversation_agent = Agent(
+    name=AGENT_NAME,
+    model=CONVERSATION_MODEL,
+    description=AGENT_DESCRIPTION,
+    instruction=AGENT_INSTRUCTION,
+    tools=AGENT_TOOLS
+)
+
+# Alias for backward compatibility if needed, but we prefer explicit naming
+root_agent = conversation_agent
+
+
+logger.info(f"Intentive Planner initialized. Modes: Thinking ({THINKING_MODEL}), Conversation ({CONVERSATION_MODEL})")

@@ -8,13 +8,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-async def set_checkin_timer(duration_minutes: int, reason: str) -> dict:
+async def set_checkin_timer(duration_minutes: int, notification_body: str, notification_title: str = "Check-in") -> dict:
     """
-    Sets a timer for a check-in.
+    Sets a timer for a check-in with a pre-generated message.
     
     Args:
         duration_minutes: Number of minutes to wait
-        reason: The reason/label for this timer (e.g. "Deep work", "Break")
+        notification_body: The actual message to send (e.g. "How is the deep work going?")
+        notification_title: The title of the notification (default: "Check-in")
         
     Returns:
         Dict with status and scheduled time
@@ -50,13 +51,16 @@ async def set_checkin_timer(duration_minutes: int, reason: str) -> dict:
                 user_id=user_id,
                 scheduled_time=scheduled_time_db,
                 event_type="checkin",
-                payload={"reason": reason}
+                payload={
+                    "title": notification_title,
+                    "body": notification_body
+                }
             )
             
         return {
             "status": "scheduled", 
             "time": scheduled_time.isoformat(),
-            "message": f"Timer set for {duration_minutes} minutes."
+            "message": f"Timer set for {duration_minutes} minutes. Will say: '{notification_body}'"
         }
         
     except Exception as e:

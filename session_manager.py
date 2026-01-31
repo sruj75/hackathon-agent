@@ -150,3 +150,15 @@ class ADKSessionManager:
             except Exception as e:
                 logger.error(f"Failed to restore session {session_id}: {e}")
                 return None
+
+    @staticmethod
+    def get_daily_session_id(user_id: str) -> str:
+        """
+        Generates the deterministic session ID for a user's daily agent thread.
+        Format: session_{user_id}_{YYYY-MM-DD}
+        
+        This ensures that whether we are accessed via Cron (Start/Check-in) 
+        or via WebSocket (Voice), we always hit the SAME session.
+        """
+        today = datetime.now().date().isoformat()
+        return f"session_{user_id}_{today}"
