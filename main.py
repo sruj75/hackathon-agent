@@ -140,6 +140,13 @@ async def websocket_endpoint(
     set_ui_event_queue(ui_event_queue)
     logger.info("UI event queue created for this connection")
 
+    # Send simple activation message to initiate conversation and let agent greet naturally
+    activation_message = types.Content(
+        parts=[types.Part(text="Hello")]
+    )
+    live_request_queue.send_content(activation_message)
+    logger.info("Sent activation message to start conversation")
+
     # ========================================
     # Bidirectional Streaming Tasks
     # ========================================
@@ -276,4 +283,4 @@ async def websocket_endpoint(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
