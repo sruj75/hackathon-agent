@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from sqlalchemy import String, JSON, Boolean, DateTime
+from sqlalchemy import String, JSON, Boolean, DateTime, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 from database import Base
 import uuid
@@ -43,4 +43,5 @@ class ScheduledEvent(Base):
     event_type: Mapped[str] = mapped_column(String, nullable=False)  # "checkin", "morning_wake", "evening_reflection"
     payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # { reason: "...", message: "..." }
     executed: Mapped[bool] = mapped_column(Boolean, default=False)
+    cron_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # cron-jobs.org job ID for cleanup
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

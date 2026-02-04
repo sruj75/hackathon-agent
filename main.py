@@ -39,10 +39,10 @@ from fastapi import Header, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db, SessionLocal
 from repos import event_repo, user_repo
-from event_handlers import handle_event
 from datetime import datetime, timedelta, time
 import os
 from agent_runtime import AgentRuntime
+import cron_service
 
 # Configure logging
 logging.basicConfig(
@@ -56,8 +56,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # Application name constant
 APP_NAME = "intentive-coach"
-
-CRON_API_KEY = os.getenv("CRON_API_KEY", "dev-secret-key")  # Set in production
 
 # ========================================
 # FastAPI App Setup
@@ -104,33 +102,27 @@ async def health():
 # Cron Endpoints
 # ========================================
 
-@app.get("/api/check-pending")
-async def check_pending_events(
-    db: AsyncSession = Depends(get_db),
-    x_cron_secret: str = Header(None)
-):
-    """Called by external cron every 1-5 minutes."""
-    if x_cron_secret != CRON_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    events = await event_repo.get_pending_events(db, before_time=datetime.now())
-    return {"pending": [e.id for e in events]}
-
 @app.post("/api/execute-event/{event_id}")
 async def execute_event(
     event_id: str,
-    db: AsyncSession = Depends(get_db),
-    x_cron_secret: str = Header(None)
+    db: AsyncSession = Depends(get_db)
 ):
-    """Execute a specific scheduled event."""
-    if x_cron_secret != CRON_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    """
+    Execute a specific scheduled event.
+    Called by cron-jobs.org at the scheduled time.
     
+    Security: Event IDs are UUIDs (unguessable) and execution is idempotent.
+    """
     event = await event_repo.get_by_id(db, event_id)
     
     # Null check: if event doesn't exist, return 404
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Idempotency check: if already executed, return success
+    if event.executed:
+        logger.info(f"Event {event_id} already executed, skipping")
+        return {"status": "already_executed"}
     
     # Agent Logic (Hybrid Architecture)
     # UNIFIED ARCHITECTURE: Thinking Mode (Standard API) via AgentRuntime
@@ -152,7 +144,8 @@ async def execute_event(
         async for agent_event in AgentRuntime.run_thinking_mode(
             user_id=event.user_id,
             trigger_context=trigger_prompt,
-            session_manager=session_manager
+            session_manager=session_manager,
+            db=db
         ):
             # Log significant events
             if hasattr(agent_event, "content") and agent_event.content and agent_event.content.parts:
@@ -166,7 +159,17 @@ async def execute_event(
         logger.error(f"❌ [THINKING] Agent failed to run: {e}")
         # Don't re-raise, we still want to mark event as executed so we don't loop forever
     
+    # Mark event as executed
     await event_repo.mark_executed(db, event_id)
+    
+    # Cleanup: Delete the cron job from cron-jobs.org
+    if event.cron_job_id:
+        try:
+            await cron_service.delete_job(event.cron_job_id)
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to cleanup cron job {event.cron_job_id}: {cleanup_error}")
+            # Don't fail the request if cleanup fails
+    
     return {"status": "executed", "agent_response": "processed"}
 
 @app.post("/api/save-token")
@@ -178,11 +181,17 @@ async def save_push_token(
     Saves the user's Expo push token.
     Payload expected: {"user_id": "...", "token": "..."}
     """
+    import re
+    
     user_id = payload.get("user_id")
     token = payload.get("token")
     
     if not user_id or not token:
         raise HTTPException(status_code=400, detail="Missing user_id or token")
+    
+    # Validate Expo token format
+    if not re.match(r'^ExponentPushToken\[.+\]$', token):
+        raise HTTPException(status_code=400, detail="Invalid token format")
         
     await user_repo.save_push_token(db, user_id, token)
     return {"status": "saved", "user_id": user_id}
@@ -220,7 +229,8 @@ async def schedule_morning_wakes():
             )
             
             if not existing:
-                await event_repo.create_event(
+                # Create event
+                event = await event_repo.create_event(
                     db, 
                     user.user_id, 
                     wake_dt, 
@@ -230,8 +240,49 @@ async def schedule_morning_wakes():
                         "body": "Time to design your day. Ready to start?"
                     }
                 )
-                count += 1
-                logger.info(f"   ✅ Scheduled wake for {user.user_id} at {wake_dt}")
+                
+                # Create corresponding cron job
+                try:
+                    import pytz
+                    tz_name = user.timezone or "UTC"
+                    wake_dt_aware = pytz.timezone(tz_name).localize(wake_dt)
+                    
+                    cron_job_id = await cron_service.create_one_time_job(
+                        target_datetime=wake_dt_aware,
+                        event_id=event.id,
+                        timezone=tz_name
+                    )
+                    
+                    await event_repo.update_cron_job_id(db, event.id, cron_job_id)
+                    count += 1
+                    logger.info(f"   ✅ Scheduled wake for {user.user_id} at {wake_dt} (cron job {cron_job_id})")
+                    
+                except Exception as cron_error:
+                    logger.error(f"   ❌ Failed to create cron job for {user.user_id}: {cron_error}")
+                    # Delete the event since we couldn't create the cron job
+                    await db.delete(event)
+                    await db.commit()
+                    
+            elif existing and not existing.cron_job_id:
+                # Event exists but has no cron job (recovery from old polling system)
+                logger.info(f"   🔧 Recovering cron job for existing event {existing.id}")
+                try:
+                    import pytz
+                    tz_name = user.timezone or "UTC"
+                    wake_dt_aware = pytz.timezone(tz_name).localize(wake_dt)
+                    
+                    cron_job_id = await cron_service.create_one_time_job(
+                        target_datetime=wake_dt_aware,
+                        event_id=existing.id,
+                        timezone=tz_name
+                    )
+                    
+                    await event_repo.update_cron_job_id(db, existing.id, cron_job_id)
+                    logger.info(f"   ✅ Recovered cron job {cron_job_id} for {user.user_id}")
+                    
+                except Exception as cron_error:
+                    logger.error(f"   ❌ Failed to recover cron job for {user.user_id}: {cron_error}")
+                    
             else:
                 logger.info(f"   Note: Wake already scheduled for {user.user_id}")
                 

@@ -8,7 +8,7 @@ from google.adk.runners import Runner
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import types
 
-from context import current_user_id, current_session_id
+from context import current_user_id, current_session_id, current_db
 from session_manager import ADKSessionManager
 from voice_agent.agent import thinking_agent, conversation_agent
 
@@ -30,7 +30,8 @@ class AgentRuntime:
     async def run_thinking_mode(
         user_id: str, 
         trigger_context: str, 
-        session_manager: ADKSessionManager
+        session_manager: ADKSessionManager,
+        db = None
     ) -> AsyncGenerator[types.GenerateContentResponse, None]:
         """
         Executes a single turn of the agent in "Thinking Mode" (Text).
@@ -43,6 +44,8 @@ class AgentRuntime:
         # 2. Set Context
         current_user_id.set(user_id)
         current_session_id.set(session_id)
+        if db is not None:
+            current_db.set(db)
         
         # 3. Initialize Session (Load RAM + DB)
         await session_manager.get_or_create_session(

@@ -5,27 +5,28 @@ from datetime import datetime
 from typing import Optional, List
 import uuid
 
-async def create_event(db: AsyncSession, user_id: str, scheduled_time: datetime, event_type: str, payload: dict) -> ScheduledEvent:
+async def create_event(db: AsyncSession, user_id: str, scheduled_time: datetime, event_type: str, payload: dict, cron_job_id: Optional[int] = None) -> ScheduledEvent:
     event = ScheduledEvent(
         id=str(uuid.uuid4()),
         user_id=user_id,
         scheduled_time=scheduled_time,
         event_type=event_type,
         payload=payload,
-        executed=False
+        executed=False,
+        cron_job_id=cron_job_id
     )
     db.add(event)
     await db.commit()
     await db.refresh(event)
     return event
 
-async def get_pending_events(db: AsyncSession, before_time: datetime) -> List[ScheduledEvent]:
-    result = await db.execute(
-        select(ScheduledEvent)
-        .where(ScheduledEvent.executed == False)
-        .where(ScheduledEvent.scheduled_time <= before_time)
-    )
-    return list(result.scalars().all())
+async def update_cron_job_id(db: AsyncSession, event_id: str, cron_job_id: int) -> None:
+    """Update the cron_job_id for an event after creating the cron job."""
+    result = await db.execute(select(ScheduledEvent).where(ScheduledEvent.id == event_id))
+    event = result.scalar_one_or_none()
+    if event:
+        event.cron_job_id = cron_job_id
+        await db.commit()
 
 async def mark_executed(db: AsyncSession, event_id: str) -> None:
     result = await db.execute(select(ScheduledEvent).where(ScheduledEvent.id == event_id))

@@ -1,25 +1,55 @@
 from notification_service import send_push_notification
-from context import current_user_id
+from context import current_user_id, current_session_id, current_db
 import logging
 
 logger = logging.getLogger(__name__)
 
-async def send_push_notification_tool(title: str, body: str) -> str:
+async def send_push_notification_tool(
+    title: str,
+    body: str,
+    notification_type: str = "checkin"
+) -> str:
     """
-    Sends a push notification to the user's device.
-    Use this when you need to alert the user about something important (e.g., a timer ending).
-    
+    Send a push notification to the user's device.
+
+    Use this when you want to invite the user to join a conversation.
+    The notification will include session context so the conversation can resume.
+
     Args:
-        title: The title of the notification (short and punchy).
-        body: The main content of the notification.
+        title: Notification title (e.g., "Check-in", "Good Morning")
+        body: Notification message (e.g., "How's deep work going?")
+        notification_type: Type of notification (e.g., "checkin", "morning_wake")
+
+    Returns:
+        Success message or error description
     """
     user_id = current_user_id.get()
+    session_id = current_session_id.get()
+    db = current_db.get()
+    
     if not user_id:
+        logger.error("[send_push_notification_tool] No current user context found")
         return "Error: No current user context found."
+    
+    if not db:
+        logger.error("[send_push_notification_tool] No database session found")
+        return "Error: No database session available."
         
-    logger.info(f"Agent executing send_push_notification_tool: {title} - {body}")
+    logger.info(
+        f"[send_push_notification_tool] Agent sending notification: "
+        f"title='{title}', body='{body}', type='{notification_type}'"
+    )
     
-    # We include a 'type': 'notification' in data so the frontend can handle it genericly if needed
-    await send_push_notification(user_id, title, body, data={"type": "agent_alert"})
+    # Data payload for deep linking
+    data = {
+        "session_id": session_id,
+        "type": notification_type,
+        "user_id": user_id
+    }
     
-    return f"Notification sent: {title}"
+    success = await send_push_notification(db, user_id, title, body, data)
+    
+    if success:
+        return f"✅ Notification sent: {title}"
+    else:
+        return f"⚠️ Failed to send notification (user may not have push enabled)"
