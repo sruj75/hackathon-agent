@@ -8,6 +8,7 @@ This is the production FastAPI server that provides:
 import asyncio
 import json
 import logging
+import os
 import warnings
 from pathlib import Path
 
@@ -283,4 +284,9 @@ async def websocket_endpoint(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Get host and port from environment variables
+    host = os.getenv("BACKEND_HOST")
+    port = int(os.getenv("BACKEND_PORT"))
+    
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)
