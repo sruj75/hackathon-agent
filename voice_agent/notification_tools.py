@@ -34,6 +34,9 @@ async def send_push_notification_tool(
     if not db:
         logger.error("[send_push_notification_tool] No database session found")
         return "Error: No database session available."
+    
+    if not session_id:
+        logger.warning("[send_push_notification_tool] No session_id found - notification will not support conversation resume")
         
     logger.info(
         f"[send_push_notification_tool] Agent sending notification: "

@@ -1,7 +1,21 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from models import UserProfile, UserPushToken
 from typing import Optional, List
+
+async def create_profile(db: AsyncSession, user_id: str, wake_time: str, bedtime: str, timezone: str = "UTC", health_anchors: Optional[List[str]] = None) -> UserProfile:
+    """Create a new user profile."""
+    profile = UserProfile(
+        user_id=user_id,
+        wake_time=wake_time,
+        bedtime=bedtime,
+        timezone=timezone,
+        health_anchors=health_anchors or []
+    )
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+    return profile
 
 async def get_profile(db: AsyncSession, user_id: str) -> Optional[UserProfile]:
     result = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
@@ -41,3 +55,8 @@ async def save_push_token(db: AsyncSession, user_id: str, token: str) -> UserPus
 async def get_all_users(db: AsyncSession) -> List[UserProfile]:
     result = await db.execute(select(UserProfile))
     return list(result.scalars().all())
+
+async def delete_push_token(db: AsyncSession, user_id: str) -> None:
+    """Delete a push token for a user."""
+    await db.execute(delete(UserPushToken).where(UserPushToken.user_id == user_id))
+    await db.commit()

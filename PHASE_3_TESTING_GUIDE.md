@@ -1,12 +1,5 @@
 # Phase 3: Push Notifications - Manual Testing Guide
 
-## Prerequisites
-
-1. **Physical iOS Device** (iPhone/iPad) - Push notifications don't work in simulator
-2. **Expo Go App** installed OR development build
-3. **Device and computer on same network** (for local testing)
-4. **Backend running** on your local machine
-
 ## Setup Steps
 
 ### 1. Start Backend Server
@@ -40,16 +33,18 @@ npx expo start
 
 ### 4. Run App on Physical Device
 
-**Option A: Expo Go (Easier)**
-- Open Expo Go app on your device
-- Scan the QR code from terminal
-- App will load
-
-**Option B: Development Build (Better for testing)**
+**Development Build (Better for testing)**
 ```bash
 # Build and install on device
-eas build --profile development --platform ios --local
+eas build --profile development --platform ios
 ```
+
+That's it! The app will:
+Automatically request notification permissions
+Get the Expo push token
+Save it to your backend database
+Be ready to receive notifications
+
 
 ### 5. Get Push Token
 

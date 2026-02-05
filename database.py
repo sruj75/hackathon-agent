@@ -4,7 +4,8 @@ from sqlalchemy.orm import DeclarativeBase
 import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_URL = f"sqlite+aiosqlite:///{os.path.join(BASE_DIR, 'intentive.db')}"
+DEFAULT_DATABASE_URL = f"sqlite+aiosqlite:///{os.path.join(BASE_DIR, 'intentive.db')}"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 engine = create_async_engine(DATABASE_URL, echo=True)
 

@@ -131,12 +131,8 @@ async def execute_event(
 # Agent Logic: Thinking Mode (Text)
 # ========================================
     
-    # 1. Trigger Prompt
-    trigger_prompt = (
-        f"SYSTEM_TRIGGER: The timer for event '{event.event_type}' has ended. "
-        f"Context: {event.payload}. "
-        "Decide if you need to alert the user using `send_push_notification`."
-    )
+    # 1. Trigger Prompt (Minimal - agent uses tools to understand context)
+    trigger_prompt = "You just woke up."
     
     # 2. Run Turn via AgentRuntime
     logger.info(f"--- Calling AgentRuntime.run_thinking_mode for user {event.user_id} ---")
@@ -483,6 +479,35 @@ async def websocket_endpoint(
         logger.info("Closing live_request_queue")
         live_request_queue.close()
         set_ui_event_queue(None)  # Clear the queue reference
+        
+        # ========================================
+        # POST-CONVERSATION THINKING TURN
+        # ========================================
+        logger.info("🧠 [POST-CONVERSATION] Triggering thinking mode after conversation ended")
+        
+        try:
+            # Trigger thinking mode to:
+            # 1. Review what happened in the conversation
+            # 2. Check calendar for what's next
+            # 3. Set appropriate timer for next intervention
+            # Minimal trigger - agent uses tools to understand context
+            trigger_context = "Conversation just ended."
+            
+            async for _ in AgentRuntime.run_thinking_mode(
+                user_id=user_id,
+                trigger_context=trigger_context,
+                session_manager=session_manager
+            ):
+                pass  # We don't need to process the events, just let it run
+            
+            logger.info("✅ [POST-CONVERSATION] Thinking turn completed successfully")
+            
+        except Exception as thinking_error:
+            logger.error(
+                f"❌ [POST-CONVERSATION] Failed to run thinking turn: {thinking_error}",
+                exc_info=True
+            )
+            # Don't raise - we don't want to fail the WebSocket close due to this
 
 
 # ========================================

@@ -4,7 +4,7 @@ from models import AgentSession
 from typing import Optional
 from datetime import datetime
 
-async def save_session(db: AsyncSession, session_id: str, state: dict) -> AgentSession:
+async def save_session(db: AsyncSession, session_id: str, state: dict, user_id: Optional[str] = None, date: Optional[str] = None) -> AgentSession:
     # Need user_id and date from state or passed in args?
     # task.md says: `save_session(db, session_id, state)`
     # The model requires user_id and date. 
@@ -25,20 +25,20 @@ async def save_session(db: AsyncSession, session_id: str, state: dict) -> AgentS
         # Let's assume state has user_id and date, or we fail.
         # But wait, 1.5 says: `await session_repo.save_session(db, session_id, agent.state)`
         # agent.state usually has context.
-        user_id = state.get('user_id')
-        date_str = state.get('date', datetime.now().strftime("%Y-%m-%d"))
+        u_id = user_id or state.get('user_id')
+        d_str = date or state.get('date', datetime.now().strftime("%Y-%m-%d"))
         
-        if not user_id:
+        if not u_id:
             # Fallback or error? For v0, let's look at get_or_create_session in session_manager logic.
             # Ideally save_session is called on an existing session.
             # But let's handle creation if possible.
             # If user_id is missing, we can't create.
-             raise ValueError("user_id required in state for new session")
+             raise ValueError("user_id required in state or args for new session")
 
         session = AgentSession(
             session_id=session_id,
-            user_id=user_id,
-            date=date_str,
+            user_id=u_id,
+            date=d_str,
             state=state
         )
         db.add(session)

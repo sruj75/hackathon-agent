@@ -20,13 +20,15 @@ async def create_event(db: AsyncSession, user_id: str, scheduled_time: datetime,
     await db.refresh(event)
     return event
 
-async def update_cron_job_id(db: AsyncSession, event_id: str, cron_job_id: int) -> None:
+async def update_cron_job_id(db: AsyncSession, event_id: str, cron_job_id: int) -> bool:
     """Update the cron_job_id for an event after creating the cron job."""
     result = await db.execute(select(ScheduledEvent).where(ScheduledEvent.id == event_id))
     event = result.scalar_one_or_none()
-    if event:
-        event.cron_job_id = cron_job_id
-        await db.commit()
+    if event is None:
+        return False
+    event.cron_job_id = cron_job_id
+    await db.commit()
+    return True
 
 async def mark_executed(db: AsyncSession, event_id: str) -> None:
     result = await db.execute(select(ScheduledEvent).where(ScheduledEvent.id == event_id))
