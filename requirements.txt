@@ -4,3 +4,4 @@ uvicorn[standard]
 python-dotenv
 composio-core
 websockets
+pytz
