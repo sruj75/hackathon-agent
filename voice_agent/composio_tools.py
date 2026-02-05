@@ -79,6 +79,61 @@ def _get_user_timezone() -> str:
 
 
 # ========================================
+# METADATA HELPERS (Task-Event Linking)
+# ========================================
+
+def extract_event_id(notes: str) -> str | None:
+    """
+    Extract event_id from task notes metadata.
+    
+    Args:
+        notes: Task notes that may contain __INTENTIVE_META__:event_id=...
+    
+    Returns:
+        Event ID string or None if not found
+    """
+    if not notes:
+        return None
+    
+    # Look for __INTENTIVE_META__:event_id=...
+    marker = "__INTENTIVE_META__:event_id="
+    if marker in notes:
+        start_idx = notes.index(marker) + len(marker)
+        # Find end of event_id (whitespace or newline)
+        end_idx = start_idx
+        while end_idx < len(notes) and notes[end_idx] not in [' ', '\n', '\r', '\t']:
+            end_idx += 1
+        return notes[start_idx:end_idx]
+    
+    return None
+
+
+def inject_event_id(notes: str, event_id: str) -> str:
+    """
+    Inject event_id link into task notes.
+    
+    Args:
+        notes: Existing task notes
+        event_id: Calendar event ID to link
+    
+    Returns:
+        Updated notes with metadata appended
+    """
+    if not notes:
+        notes = ""
+    
+    # Avoid duplicate injection
+    if "__INTENTIVE_META__:event_id=" in notes:
+        return notes
+    
+    # Append metadata on new line
+    if notes and not notes.endswith("\n"):
+        notes += "\n"
+    
+    return f"{notes}__INTENTIVE_META__:event_id={event_id}"
+
+
+# ========================================
 # CALENDAR TOOLS
 # ========================================
 
@@ -555,6 +610,276 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
 
 
 # ========================================
+# UNIFIED TASK-EVENT OPERATIONS
+# ========================================
+
+def timeblock_task(task_title: str, start_time: str, duration_minutes: int = 60, description: str = "") -> dict:
+    """
+    Schedule an existing task to the calendar (creates task-event link).
+    
+    Args:
+        task_title: Title of the task to schedule
+        start_time: Start time in format "HH:MM" (24hr) or "2024-01-15T14:00:00"
+        duration_minutes: Duration in minutes (default 60)
+        description: Optional description for the calendar event
+    
+    Returns:
+        Structured dict with event_id, task_id, and status.
+    """
+    try:
+        # 1. Find the task
+        tasks = _fetch_all_tasks(show_completed=False)
+        matching_task = None
+        
+        for task in tasks:
+            if task_title.lower() in task.get("title", "").lower():
+                matching_task = task
+                break
+        
+        if not matching_task:
+            return {
+                "success": False,
+                "error": "not_found",
+                "message": f"Couldn't find a task matching '{task_title}'"
+            }
+        
+        # 2. Create calendar event
+        event_result = create_calendar_event(
+            title=matching_task.get("title"),
+            start_time=start_time,
+            duration_minutes=duration_minutes,
+            description=description or matching_task.get("notes", "")
+        )
+        
+        if not event_result.get("success"):
+            return event_result
+        
+        # 3. Extract event ID
+        event_id = event_result["data"]["event"]["id"]
+        
+        # 4. Update task notes with metadata link
+        existing_notes = matching_task.get("notes", "")
+        updated_notes = inject_event_id(existing_notes, event_id)
+        
+        # Update the task
+        try:
+            _get_entity().execute(
+                action=Action.GOOGLETASKS_PATCH_TASK,
+                params={
+                    "tasklist_id": matching_task.get("tasklist_id"),
+                    "task_id": matching_task.get("id"),
+                    "notes": updated_notes
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update task notes with event link: {e}")
+            # Event created but linking failed - not critical
+        
+        return {
+            "success": True,
+            "data": {
+                "event_id": event_id,
+                "task_id": matching_task.get("id"),
+                "status": "scheduled",
+                "event": event_result["data"]["event"]
+            },
+            "message": f"Scheduled '{matching_task.get('title')}' at {start_time} for {duration_minutes} minutes"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error timeblocking task: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Couldn't timeblock task. Error: {str(e)}"
+        }
+
+
+def get_schedule(date: str = "today", after_time: str = None, include_tasks: bool = True) -> dict:
+    """
+    Query calendar events for a specific date with optional time filtering.
+    
+    Args:
+        date: Date in format "YYYY-MM-DD" or "today" (default: "today")
+        after_time: Optional time filter "HH:MM" - only return events starting after this time
+        include_tasks: If True, include linked task metadata (default: True)
+    
+    Returns:
+        Structured dict with filtered events list.
+    """
+    try:
+        # Parse date
+        if date == "today":
+            target_date = datetime.now().strftime("%Y-%m-%d")
+        else:
+            # Validate date format
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+                target_date = date
+            except ValueError:
+                return {
+                    "success": False,
+                    "error": "invalid_date",
+                    "message": f"Invalid date format: {date}. Use 'today' or 'YYYY-MM-DD'"
+                }
+        
+        # Fetch events for the full day
+        result = _get_entity().execute(
+            action=Action.GOOGLECALENDAR_EVENTS_LIST,
+            params={
+                "calendar_id": "primary",
+                "time_min": f"{target_date}T00:00:00",
+                "time_max": f"{target_date}T23:59:59",
+                "timezone": _get_user_timezone(),
+                "single_events": True,
+                "order_by": "startTime"
+            }
+        )
+        
+        # Extract events
+        data = result.get("data", result)
+        raw_events = data.get("items", [])
+        
+        # Transform and filter events
+        events = []
+        for event in raw_events:
+            start_raw = event.get("start", {}).get("dateTime", event.get("start", {}).get("date", ""))
+            end_raw = event.get("end", {}).get("dateTime", event.get("end", {}).get("date", ""))
+            
+            # Apply after_time filter
+            if after_time and "T" in start_raw:
+                event_time = start_raw.split("T")[1][:5]  # Extract HH:MM
+                if event_time < after_time:
+                    continue
+            
+            event_obj = {
+                "id": event.get("id", ""),
+                "title": event.get("summary", "No title"),
+                "start_time": start_raw,
+                "end_time": end_raw,
+                "description": event.get("description", "")
+            }
+            
+            # Include linked task info if requested
+            if include_tasks:
+                # Check if this event is linked to a task (search tasks for this event_id)
+                event_obj["linked_task"] = None  # TODO: Implement reverse lookup if needed
+            
+            events.append(event_obj)
+        
+        # Build message
+        if not events:
+            if after_time:
+                message = f"No events found after {after_time} on {target_date}"
+            else:
+                message = f"No events found on {target_date}"
+        else:
+            if after_time:
+                message = f"Found {len(events)} event(s) after {after_time}"
+            else:
+                message = f"Found {len(events)} event(s) on {target_date}"
+        
+        return {
+            "success": True,
+            "data": {"events": events},
+            "message": message
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting schedule: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "data": {"events": []},
+            "message": f"Couldn't fetch schedule. Error: {str(e)}"
+        }
+
+
+def check_conflicts(start_time: str, end_time: str) -> dict:
+    """
+    Check for calendar conflicts in a given time range.
+    
+    Args:
+        start_time: Start time in format "HH:MM" or "YYYY-MM-DDTHH:MM:SS"
+        end_time: End time in format "HH:MM" or "YYYY-MM-DDTHH:MM:SS"
+    
+    Returns:
+        Structured dict with has_conflicts flag and list of conflicting events.
+    """
+    try:
+        # Parse start and end times
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        # Handle simple time format like "14:00"
+        if len(start_time) <= 5 and ":" in start_time:
+            start_dt = datetime.fromisoformat(f"{today}T{start_time}:00")
+        else:
+            start_dt = datetime.fromisoformat(start_time.replace("Z", ""))
+        
+        if len(end_time) <= 5 and ":" in end_time:
+            end_dt = datetime.fromisoformat(f"{today}T{end_time}:00")
+        else:
+            end_dt = datetime.fromisoformat(end_time.replace("Z", ""))
+        
+        # Query events in the time range
+        result = _get_entity().execute(
+            action=Action.GOOGLECALENDAR_EVENTS_LIST,
+            params={
+                "calendar_id": "primary",
+                "time_min": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "time_max": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timezone": _get_user_timezone(),
+                "single_events": True,
+                "order_by": "startTime"
+            }
+        )
+        
+        # Extract events
+        data = result.get("data", result)
+        raw_events = data.get("items", [])
+        
+        # Check for overlaps (simple overlap: event exists in the range)
+        conflicts = []
+        for event in raw_events:
+            event_start = event.get("start", {}).get("dateTime", "")
+            event_end = event.get("end", {}).get("dateTime", "")
+            
+            if event_start and event_end:
+                conflicts.append({
+                    "id": event.get("id", ""),
+                    "title": event.get("summary", "No title"),
+                    "start_time": event_start,
+                    "end_time": event_end
+                })
+        
+        has_conflicts = len(conflicts) > 0
+        
+        if has_conflicts:
+            conflict_titles = [c["title"] for c in conflicts]
+            message = f"Found {len(conflicts)} conflict(s): {', '.join(conflict_titles)}"
+        else:
+            message = f"No conflicts found between {start_time} and {end_time}"
+        
+        return {
+            "success": True,
+            "data": {
+                "has_conflicts": has_conflicts,
+                "conflicts": conflicts
+            },
+            "message": message
+        }
+    
+    except Exception as e:
+        logger.error(f"Error checking conflicts: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "data": {"has_conflicts": False, "conflicts": []},
+            "message": f"Couldn't check conflicts. Error: {str(e)}"
+        }
+
+
+# ========================================
 # TASKS TOOLS
 # ========================================
 
@@ -654,6 +979,112 @@ def list_all_tasks() -> dict:
             "success": False,
             "error": str(e),
             "data": {"tasks": []},
+            "message": f"Couldn't fetch tasks. Error: {str(e)}"
+        }
+
+
+def get_tasks_filtered(status: str = "pending") -> dict:
+    """
+    Query tasks with filtering by scheduling status.
+    
+    Args:
+        status: Filter by status - "pending" (unscheduled), "scheduled" (has event link), 
+                "completed", or "all"
+    
+    Returns:
+        Structured dict with filtered tasks and counts.
+    """
+    try:
+        # Fetch tasks based on status
+        show_completed = status in ["completed", "all"]
+        raw_tasks = _fetch_all_tasks(show_completed=show_completed)
+        
+        # Categorize tasks
+        pending_tasks = []
+        scheduled_tasks = []
+        completed_tasks = []
+        
+        for task in raw_tasks:
+            title = task.get("title", "No title")
+            notes = task.get("notes", "")
+            task_status = task.get("status", "needsAction")
+            
+            # Check if task is linked to event
+            event_id = extract_event_id(notes)
+            is_scheduled = event_id is not None
+            
+            # Check goal linking (existing feature)
+            is_goal_linked = "[GOAL:" in notes
+            # Clean notes by removing metadata
+            clean_notes = notes.replace("[GOAL:yearly]", "").strip() if is_goal_linked else notes
+            # Also remove event link metadata from display
+            if event_id:
+                clean_notes = clean_notes.replace(f"__INTENTIVE_META__:event_id={event_id}", "").strip()
+            
+            task_obj = {
+                "id": task.get("id", ""),
+                "title": title,
+                "notes": clean_notes,
+                "due": task.get("due", ""),
+                "is_goal_linked": is_goal_linked,
+                "tasklist_id": task.get("tasklist_id", ""),
+                "event_id": event_id
+            }
+            
+            # Categorize
+            if task_status == "completed":
+                task_obj["status"] = "completed"
+                completed_tasks.append(task_obj)
+            elif is_scheduled:
+                task_obj["status"] = "scheduled"
+                scheduled_tasks.append(task_obj)
+            else:
+                task_obj["status"] = "pending"
+                pending_tasks.append(task_obj)
+        
+        # Filter by requested status
+        if status == "pending":
+            filtered_tasks = pending_tasks
+        elif status == "scheduled":
+            filtered_tasks = scheduled_tasks
+        elif status == "completed":
+            filtered_tasks = completed_tasks
+        elif status == "all":
+            filtered_tasks = pending_tasks + scheduled_tasks + completed_tasks
+        else:
+            return {
+                "success": False,
+                "error": "invalid_status",
+                "message": f"Invalid status: {status}. Use 'pending', 'scheduled', 'completed', or 'all'"
+            }
+        
+        # Build message
+        counts = {
+            "pending": len(pending_tasks),
+            "scheduled": len(scheduled_tasks),
+            "completed": len(completed_tasks)
+        }
+        
+        if not filtered_tasks:
+            message = f"No {status} tasks found"
+        else:
+            message = f"Found {len(filtered_tasks)} {status} task(s)"
+        
+        return {
+            "success": True,
+            "data": {
+                "tasks": filtered_tasks,
+                "counts": counts
+            },
+            "message": message
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting filtered tasks: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "data": {"tasks": [], "counts": {}},
             "message": f"Couldn't fetch tasks. Error: {str(e)}"
         }
 
@@ -800,6 +1231,7 @@ def complete_task(task_title: str) -> dict:
 def delete_task(task_title: str) -> dict:
     """
     Deletes a task by searching for its title.
+    Also deletes linked calendar event if one exists.
     
     Args:
         task_title: The title (or part of it) of the task to delete
@@ -824,6 +1256,10 @@ def delete_task(task_title: str) -> dict:
                 "message": f"Couldn't find a task matching '{task_title}'"
             }
         
+        # Check if task has linked calendar event
+        notes = matching.get("notes", "")
+        event_id = extract_event_id(notes)
+        
         # Delete the task
         _get_entity().execute(
             action=Action.GOOGLETASKS_DELETE_TASK,
@@ -833,11 +1269,36 @@ def delete_task(task_title: str) -> dict:
             }
         )
         
+        # Also delete linked calendar event if it exists
+        removed_event = False
+        if event_id:
+            try:
+                _get_entity().execute(
+                    action=Action.GOOGLECALENDAR_DELETE_EVENT,
+                    params={
+                        "calendar_id": "primary",
+                        "event_id": event_id
+                    }
+                )
+                removed_event = True
+                logger.info(f"Deleted linked calendar event {event_id} for task '{task_title}'")
+            except Exception as e:
+                logger.warning(f"Failed to delete linked event {event_id}: {e}")
+                # Task is deleted, event deletion failure is not critical
+        
         deleted_title = matching.get('title', task_title)
+        message = f"Deleted task: {deleted_title}"
+        if removed_event:
+            message += " (and linked calendar event)"
+        
         return {
             "success": True,
-            "data": {"deleted_task_id": matching.get("id"), "deleted_title": deleted_title},
-            "message": f"Deleted task: {deleted_title}"
+            "data": {
+                "deleted_task_id": matching.get("id"), 
+                "deleted_title": deleted_title,
+                "removed_event": removed_event
+            },
+            "message": message
         }
     except Exception as e:
         logger.error(f"Error deleting task: {e}", exc_info=True)
@@ -1473,4 +1934,62 @@ def tasks_tool(operation: str, params = None):
         }
     
     logger.info(f"[TASKS_TOOL] <<< success={result.get('success')}, has_data={'data' in result}")
+    return result
+
+
+# ========================================
+# UNIFIED TASK MANAGEMENT (Agent-Facing Interface)
+# ========================================
+
+def task_management(operation: str, params: dict = None) -> dict:
+    """
+    Unified task management tool (handles Google Tasks + Calendar linking).
+    
+    This is the main interface for the agent. It abstracts away the complexity
+    of managing two separate Google services (Tasks and Calendar) and presents
+    a unified task management system.
+    
+    Operations:
+    - add_task: Create unscheduled task (params: title, notes, linked_to_goal)
+    - timeblock_task: Schedule task to calendar (params: task_title, start_time, duration_minutes)
+    - complete_task: Mark task done (params: task_title)
+    - delete_task: Remove task and linked event (params: task_title)
+    - get_tasks: Query tasks with filtering (params: status = "pending"|"scheduled"|"completed"|"all")
+    - get_schedule: Query calendar events (params: date, after_time, include_tasks)
+    - check_conflicts: Validate time slot (params: start_time, end_time)
+    
+    Args:
+        operation: The operation to perform
+        params: Parameters for the operation (optional)
+    
+    Returns:
+        Structured dict with success status, data, and message.
+    """
+    if params is None:
+        params = {}
+    
+    logger.info(f"[TASK_MGMT] >>> operation={operation}, params={params}")
+    
+    if operation == "add_task":
+        result = add_task(**params)
+    elif operation == "timeblock_task":
+        result = timeblock_task(**params)
+    elif operation == "complete_task":
+        result = complete_task(**params)
+    elif operation == "delete_task":
+        result = delete_task(**params)
+    elif operation == "get_tasks":
+        result = get_tasks_filtered(**params)
+    elif operation == "get_schedule":
+        result = get_schedule(**params)
+    elif operation == "check_conflicts":
+        result = check_conflicts(**params)
+    else:
+        result = {
+            "success": False,
+            "error": "invalid_operation",
+            "message": f"Unknown operation: {operation}. Valid: add_task, timeblock_task, complete_task, delete_task, get_tasks, get_schedule, check_conflicts"
+        }
+    
+    logger.info(f"[TASK_MGMT] <<< success={result.get('success')}, has_data={'data' in result}")
     return result

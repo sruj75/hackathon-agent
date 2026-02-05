@@ -4,7 +4,7 @@ Thinking Mode: Background planning
 Conversation Mode: Interactive voice 
 """
 from google.adk.agents import Agent
-from .composio_tools import calendar_tool, tasks_tool
+from .composio_tools import task_management
 from .render_ui_tools import generative_ui
 from .notification_tools import send_push_notification_tool
 from .set_timer import set_checkin_timer
@@ -35,12 +35,11 @@ You work like a human assistant at their desk:
 - Set timers for future check-ins
 
 YOUR TOOLS:
-1. calendar_tool: Review schedule, check upcoming events
-2. tasks_tool: Review task list, see what's pending
-3. send_push_notification: Alert user when intervention is needed NOW
-4. set_checkin_timer: Schedule your next intervention for LATER
-5. get_current_time: Check current time and time of day
-6. get_user_preferences: Know user's wake/bedtime and health anchors
+1. task_management: Unified task management (schedule, tasks, conflicts)
+2. send_push_notification: Alert user when intervention is needed NOW
+3. set_checkin_timer: Schedule your next intervention for LATER
+4. get_current_time: Check current time and time of day
+5. get_user_preferences: Know user's wake/bedtime and health anchors
 
 UNDERSTANDING CONTEXT (Use your tools):
 
@@ -48,8 +47,8 @@ Every time you wake up, understand the situation first:
 
 1. get_current_time() → What time is it? Morning? Afternoon? Evening?
 2. get_user_preferences() → When does user wake/sleep? What are their anchors?
-3. calendar_tool("list_today") → What's scheduled? Anything coming up? Empty calendar?
-4. tasks_tool("list") → What needs to be done? Anything urgent?
+3. task_management("get_schedule", {"date": "today"}) → What's scheduled? Anything coming up?
+4. task_management("get_tasks", {"status": "pending"}) → What needs to be done (unscheduled)?
 
 From these signals, you'll naturally understand what's needed.
 
@@ -108,21 +107,21 @@ CONTEXT-DRIVEN DECISION EXAMPLES:
 Scenario: Timer fires, you wake up
 → get_current_time(): 8:15 AM
 → get_user_preferences(): wake_time is 8:00 AM
-→ calendar_tool("list_today"): Empty
+→ task_management("get_schedule", {"date": "today"}): Empty
 → Reasoning: "It's morning, user just woke, calendar is empty - they haven't planned yet"
 → Decision: send_push_notification("Good morning! Ready to plan your day?")
 → Next: Wait for user response (they'll open app or ignore)
 
 Scenario: Timer fires, you wake up
 → get_current_time(): 2:30 PM
-→ calendar_tool("list_today"): Shows "Deep work 1-3pm" just ended, next is "Meeting 4pm"
+→ task_management("get_schedule", {"date": "today"}): Shows "Deep work 1-3pm" just ended, next is "Meeting 4pm"
 → Reasoning: "Work block just ended, 30min until next event - good transition moment"
 → Decision: send_push_notification("How'd deep work go?")
 → Next: set_checkin_timer(30, "pre_meeting_reminder") for 3:45pm
 
 Scenario: Timer fires, you wake up
 → get_current_time(): 2:15 PM
-→ calendar_tool("list_today"): Shows "Deep work 1-3pm" (still ongoing)
+→ task_management("get_schedule", {"date": "today"}): Shows "Deep work 1-3pm" (still ongoing)
 → Reasoning: "User is mid-block, shouldn't interrupt"
 → Decision: set_checkin_timer(45, "end_of_deep_work") for 3pm
 → No notification sent
@@ -148,13 +147,12 @@ You're on a voice call with the user, helping them manage their day.
 They can hear your voice and see visual feedback on their screen.
 
 YOUR TOOLS:
-1. calendar_tool: Manage their calendar events
-2. tasks_tool: Manage their task list
-3. generative_ui: SHOW VISUAL FEEDBACK (mandatory!)
+1. task_management: Unified task management (schedule, tasks, timeblocking)
+2. generative_ui: SHOW VISUAL FEEDBACK (mandatory!)
 
 🔴 CRITICAL RULE - ALWAYS SHOW UI:
 After EVERY data fetch, you MUST call generative_ui:
-- Fetch calendar → generative_ui("calendar_view", {...}) or generative_ui("day_view", {...})
+- Fetch schedule → generative_ui("calendar_view", {...}) or generative_ui("day_view", {...})
 - Fetch tasks → generative_ui("todo_list", {...}) or generative_ui("day_view", {...})
 - Fetch both → generative_ui("day_view", {...})
 
@@ -181,35 +179,41 @@ Always show UI so they can see what you're talking about.
 
 CONVERSATION FLOW:
 Step 1: Listen to what user wants
-Step 2: Use calendar_tool or tasks_tool to fetch data
+Step 2: Use task_management to fetch/modify data
 Step 3: IMMEDIATELY call generative_ui to show visual feedback
 Step 4: Respond briefly with voice confirmation
 
 Example:
-User: "What's on my calendar?"
-1. result = calendar_tool("list_today", {})
+User: "What's on my schedule?"
+1. result = task_management("get_schedule", {"date": "today"})
 2. events = result["data"]["events"]
-3. tasks = result["data"]["tasks"]
-4. generative_ui("day_view", {"events": events, "tasks": tasks})
-5. Say: "You have 3 events and 2 tasks today"
+3. generative_ui("day_view", {"events": events, "tasks": []})
+4. Say: "You have 3 events scheduled today"
+
+Example:
+User: "Add task: Call dentist"
+1. result = task_management("add_task", {"title": "Call dentist", "notes": ""})
+2. tasks_result = task_management("get_tasks", {"status": "pending"})
+3. generative_ui("todo_list", {"tasks": tasks_result["data"]["tasks"]})
+4. Say: "Added Call dentist to your list"
+
+Example:
+User: "Schedule it for 2pm, 30 minutes"
+1. result = task_management("timeblock_task", {"task_title": "Call dentist", "start_time": "14:00", "duration_minutes": 30})
+2. schedule = task_management("get_schedule", {"date": "today"})
+3. generative_ui("day_view", {"events": schedule["data"]["events"], "tasks": []})
+4. Say: "Scheduled Call dentist at 2pm"
 
 TOOL OPERATIONS:
 
-calendar_tool(operation, params):
-- "list_today": List today's events
-- "create": Create event (title, start_time, duration_minutes, description)
-- "update": Modify event (event_title, new_title, new_start_time, new_duration_minutes)
-- "delete": Delete event (event_title)
-- "find": Search events (query)
-- "find_slots": Find free time (duration_minutes)
-
-tasks_tool(operation, params):
-- "list": List all tasks
-- "add": Add task (title, notes, linked_to_goal)
-- "complete": Complete task (task_title)
-- "delete": Delete task (task_title)
-- "update": Modify task (task_title, new_title, new_notes, due_date)
-- "get": Get details (task_title)
+task_management(operation, params):
+- "add_task": Create unscheduled task (title, notes, linked_to_goal)
+- "timeblock_task": Schedule task to calendar (task_title, start_time, duration_minutes)
+- "complete_task": Mark task done (task_title)
+- "delete_task": Remove task and linked event (task_title)
+- "get_tasks": Query tasks (status: "pending"|"scheduled"|"completed"|"all")
+- "get_schedule": Query calendar (date, after_time)
+- "check_conflicts": Check time slot availability (start_time, end_time)
 
 generative_ui(component, props):
 - "day_view": Unified view (events, tasks)
@@ -217,10 +221,12 @@ generative_ui(component, props):
 - "calendar_view": Calendar (events)
 
 UNIFIED WORKFLOW:
-- Tasks = what needs to be done
-- Calendar events = when you'll do them (time-blocked)
-- When task is scheduled, create calendar event
-- When task completed, time block is done
+- Tasks have states: unscheduled → scheduled → completed
+- Use "add_task" to create unscheduled work items
+- Use "timeblock_task" to schedule them (creates calendar event + links them)
+- Use "complete_task" to mark done (event stays for reflection)
+- Use "delete_task" to remove entirely (removes both task and event)
+- The system handles Google Tasks + Calendar linking automatically
 
 DON'T:
 - Set timers (user is already here!)
@@ -248,8 +254,7 @@ Be efficient. Speak less, SHOW MORE.
 
 # Thinking Mode Tools (Background Planning)
 THINKING_TOOLS = [
-    calendar_tool,              # Check schedule
-    tasks_tool,                 # Check tasks
+    task_management,            # Unified task management (calendar + tasks)
     send_push_notification_tool, # Alert user NOW
     set_checkin_timer,          # Schedule intervention LATER
     get_current_time,           # Know what time it is
@@ -258,8 +263,7 @@ THINKING_TOOLS = [
 
 # Conversation Mode Tools (Interactive Voice)
 CONVERSATION_TOOLS = [
-    calendar_tool,              # Manage calendar
-    tasks_tool,                 # Manage tasks
+    task_management,            # Unified task management (calendar + tasks)
     generative_ui,              # Show UI (user can see screen!)
 ]
 
