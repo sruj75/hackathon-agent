@@ -348,6 +348,8 @@ async def websocket_endpoint(
     async def upstream_task() -> None:
         """Receives messages from WebSocket and sends to LiveRequestQueue."""
         logger.debug("upstream_task started")
+        init_handled = False
+        
         try:
             while True:
                 message = await websocket.receive()
@@ -373,6 +375,27 @@ async def websocket_endpoint(
                     
                     try:
                         json_message = json.loads(text_data)
+                        
+                        # Handle init message (should be first message from client)
+                        if json_message.get("type") == "init" and not init_handled:
+                            init_handled = True
+                            resume_session_id = json_message.get("resume_session_id")
+                            trigger_type = json_message.get("trigger_type")
+                            
+                            logger.info(f"[WS-INIT] Received init handshake - resume_session_id: {resume_session_id}, trigger_type: {trigger_type}")
+                            
+                            # Store trigger_type in session state for agent context
+                            if trigger_type:
+                                session.state["trigger_type"] = trigger_type
+                                logger.info(f"[WS-INIT] Stored trigger_type in session: {trigger_type}")
+                            
+                            # If explicit resume requested, update context variable
+                            if resume_session_id and resume_session_id != unified_session_id:
+                                logger.info(f"[WS-INIT] Client requested explicit session: {resume_session_id} (current: {unified_session_id})")
+                                # Note: We keep using unified_session_id for consistency
+                                # The session was already loaded/created with the correct ID
+                            
+                            continue  # Don't process init message further
                         
                         if json_message.get("type") == "text":
                             content = types.Content(
