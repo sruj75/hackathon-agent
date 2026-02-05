@@ -34,9 +34,10 @@ def generative_ui(component: str, props = None):
     - day_view: Unified view (tasks + events together)
     - todo_list: Task list only
     - calendar_view: Calendar only
+    - stop_reflect_act: Emotional regulation wizard (STOP-REFLECT-ACT)
     
     Args:
-        component: Component type (day_view, todo_list, calendar_view)
+        component: Component type (day_view, todo_list, calendar_view, stop_reflect_act)
         props: Component properties with data to display
         
     Returns:
@@ -53,7 +54,7 @@ def generative_ui(component: str, props = None):
         props = {}
     
     valid_components = [
-        "day_view", "todo_list", "calendar_view"
+        "day_view", "todo_list", "calendar_view", "stop_reflect_act"
     ]
     
     if component not in valid_components:
