@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from composio import Composio, Action
 from datetime import datetime, timedelta
 import logging
+import pytz
 
 # Ensure .env is loaded regardless of import order (safe to call multiple times)
 load_dotenv()
@@ -160,12 +161,19 @@ def create_calendar_event(title: str, start_time: str, duration_minutes: int = 6
         Structured dict with created event data.
     """
     try:
+        user_tz = _get_user_timezone()
+        tz = pytz.timezone(user_tz)
+        
         # Handle simple time format like "14:00"
         if len(start_time) <= 5 and ":" in start_time:
             today = datetime.now().strftime("%Y-%m-%d")
-            start_dt = datetime.fromisoformat(f"{today}T{start_time}:00")
+            # Create timezone-aware datetime in user's timezone
+            start_dt = tz.localize(datetime.fromisoformat(f"{today}T{start_time}:00"))
         else:
             start_dt = datetime.fromisoformat(start_time.replace("Z", ""))
+            # If naive, localize to user's timezone
+            if start_dt.tzinfo is None:
+                start_dt = tz.localize(start_dt)
         
         end_dt = start_dt + timedelta(minutes=duration_minutes)
         
@@ -178,7 +186,7 @@ def create_calendar_event(title: str, start_time: str, duration_minutes: int = 6
             params={
                 "summary": title,
                 "start_datetime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timezone": _get_user_timezone(),
+                "timezone": user_tz,
                 "event_duration_hour": duration_hours,
                 "event_duration_minutes": duration_mins,
                 "description": description,
@@ -474,17 +482,22 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
         
         if new_start_time:
             # Handle simple time format like "14:00"
+            user_tz = _get_user_timezone()
+            tz = pytz.timezone(user_tz)
+            
             if len(new_start_time) <= 5 and ":" in new_start_time:
-                start_dt = datetime.fromisoformat(f"{today}T{new_start_time}:00")
+                start_dt = tz.localize(datetime.fromisoformat(f"{today}T{new_start_time}:00"))
             else:
                 start_dt = datetime.fromisoformat(new_start_time.replace("Z", ""))
+                if start_dt.tzinfo is None:
+                    start_dt = tz.localize(start_dt)
             
-            patch_params["start"] = {"dateTime": start_dt.isoformat(), "timeZone": _get_user_timezone()}
+            patch_params["start"] = {"dateTime": start_dt.isoformat(), "timeZone": user_tz}
             
             # Calculate end time
             duration = new_duration_minutes or 60
             end_dt = start_dt + timedelta(minutes=duration)
-            patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": _get_user_timezone()}
+            patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": user_tz}
             
             final_start = start_dt.isoformat()
             final_end = end_dt.isoformat()
