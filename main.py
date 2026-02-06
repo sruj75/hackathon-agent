@@ -141,13 +141,6 @@ async def websocket_endpoint(
     set_ui_event_queue(ui_event_queue)
     logger.info("UI event queue created for this connection")
 
-    # Send simple activation message to initiate conversation and let agent greet naturally
-    activation_message = types.Content(
-        parts=[types.Part(text="Hello")]
-    )
-    live_request_queue.send_content(activation_message)
-    logger.info("Sent activation message to start conversation")
-
     # ========================================
     # Bidirectional Streaming Tasks
     # ========================================
@@ -182,10 +175,24 @@ async def websocket_endpoint(
                         json_message = json.loads(text_data)
                         
                         if json_message.get("type") == "text":
-                            content = types.Content(
-                                parts=[types.Part(text=json_message["text"])]
-                            )
-                            live_request_queue.send_content(content)
+                            incoming_text = json_message["text"]
+                            
+                            # Detect scenario marker and send trigger to force agent response
+                            if incoming_text.startswith("[SCENARIO:"):
+                                # Send the scenario context
+                                content = types.Content(parts=[types.Part(text=incoming_text)])
+                                live_request_queue.send_content(content)
+                                
+                                # Immediately send a trigger message to make agent respond
+                                trigger_content = types.Content(
+                                    parts=[types.Part(text="Start the conversation now")]
+                                )
+                                live_request_queue.send_content(trigger_content)
+                                logger.info(f"Sent scenario {incoming_text} + trigger message to force agent greeting")
+                            else:
+                                # Normal text message
+                                content = types.Content(parts=[types.Part(text=incoming_text)])
+                                live_request_queue.send_content(content)
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON received: {text_data}")
         except Exception as e:
@@ -207,31 +214,6 @@ async def websocket_endpoint(
                     part_attrs = [a for a in ['text', 'function_call', 'function_response', 'inline_data'] if getattr(part, a, None) is not None]
                     if part_attrs:
                         logger.info(f"[MAIN-EVENT] Part {i} has: {part_attrs}")
-                    
-                    # Check for function_response in the part
-                    func_resp = getattr(part, 'function_response', None)
-                    if func_resp is not None:
-                        func_name = getattr(func_resp, 'name', 'unknown')
-                        response_data = getattr(func_resp, 'response', None)
-                        
-                        logger.info(f"[MAIN-UI] Found function_response: {func_name}")
-                        
-                        if func_name == 'generative_ui' and isinstance(response_data, dict):
-                            ui_payload = response_data.get("ui_payload")
-                            if ui_payload:
-                                logger.info(f"[MAIN-UI] >>> Detected ui_payload: component={ui_payload.get('type', 'unknown')}")
-                                
-                                # Emit custom generative_ui event to frontend
-                                ui_event = {
-                                    "type": "generative_ui",
-                                    "component": ui_payload.get("type"),
-                                    "props": ui_payload.get("props", {})
-                                }
-                                try:
-                                    await websocket.send_text(json.dumps(ui_event))
-                                    logger.info(f"[MAIN-UI] <<< SENT generative_ui WebSocket event: {ui_payload.get('type')}")
-                                except (RuntimeError, WebSocketDisconnect):
-                                    logger.warning("[MAIN-UI] WebSocket closed while sending UI event")
             
             # Send original event to client as well
             event_json = event.model_dump_json(exclude_none=True, by_alias=True)

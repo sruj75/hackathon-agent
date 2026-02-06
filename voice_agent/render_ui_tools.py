@@ -32,12 +32,10 @@ def generative_ui(component: str, props = None):
     
     Components:
     - day_view: Unified view (tasks + events together)
-    - todo_list: Task list only
-    - calendar_view: Calendar only
     - stop_reflect_act: Emotional regulation wizard (STOP-REFLECT-ACT)
     
     Args:
-        component: Component type (day_view, todo_list, calendar_view, stop_reflect_act)
+        component: Component type (day_view, stop_reflect_act)
         props: Component properties with data to display
         
     Returns:
@@ -54,7 +52,7 @@ def generative_ui(component: str, props = None):
         props = {}
     
     valid_components = [
-        "day_view", "todo_list", "calendar_view", "stop_reflect_act"
+        "day_view", "stop_reflect_act"
     ]
     
     if component not in valid_components:
@@ -64,6 +62,53 @@ def generative_ui(component: str, props = None):
             "message": f"Unknown component: {component}. Valid: {', '.join(valid_components)}",
             "ui_payload": None
         }
+    
+    # Safety net for day_view: fetch data in-tool only when payload is missing/empty.
+    # Agent can call day_view with no props, and safety net will populate data.
+    if component == "day_view":
+        events = props.get("events", []) if isinstance(props, dict) else []
+        tasks = props.get("tasks", []) if isinstance(props, dict) else []
+        needs_events = not isinstance(events, list) or len(events) == 0
+        needs_tasks = not isinstance(tasks, list) or len(tasks) == 0
+
+        if needs_events or needs_tasks:
+            logger.info(
+                f"[GENERATIVE_UI] day_view safety net triggered: events_missing={needs_events}, tasks_missing={needs_tasks}"
+            )
+            from .composio_tools import list_todays_events, list_all_tasks
+
+            if needs_events:
+                logger.info("[GENERATIVE_UI] Auto-fetching calendar events...")
+                events_result = list_todays_events()
+                if events_result.get("success"):
+                    events = events_result.get("data", {}).get("events", [])
+                    logger.info(f"[GENERATIVE_UI] Fetched {len(events)} events")
+                else:
+                    logger.warning(
+                        f"[GENERATIVE_UI] Failed to fetch events: {events_result.get('message')}"
+                    )
+                    events = []
+
+            if needs_tasks:
+                logger.info("[GENERATIVE_UI] Auto-fetching tasks...")
+                tasks_result = list_all_tasks()
+                if tasks_result.get("success"):
+                    tasks = tasks_result.get("data", {}).get("tasks", [])
+                    logger.info(f"[GENERATIVE_UI] Fetched {len(tasks)} tasks")
+                else:
+                    logger.warning(
+                        f"[GENERATIVE_UI] Failed to fetch tasks: {tasks_result.get('message')}"
+                    )
+                    tasks = []
+
+            props = {"events": events, "tasks": tasks}
+            logger.info(
+                f"[GENERATIVE_UI] Safety net complete - rendering with {len(events)} events, {len(tasks)} tasks"
+            )
+        else:
+            logger.info(
+                f"[GENERATIVE_UI] day_view using provided payload - events={len(events)}, tasks={len(tasks)}"
+            )
     
     # Log props summary (avoid logging huge data)
     props_keys = list(props.keys()) if props else []
