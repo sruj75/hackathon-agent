@@ -416,6 +416,14 @@ async def websocket_endpoint(
             live_request_queue=live_request_queue,
             run_config=run_config,
         ):
+            # ✅ NEW: Explicitly check and log transcriptions
+            if hasattr(event, 'server_content') and event.server_content:
+                if hasattr(event.server_content, 'input_transcription') and event.server_content.input_transcription:
+                    logger.info(f"[TRANSCRIPTION-INPUT] User: {event.server_content.input_transcription.text}")
+                
+                if hasattr(event.server_content, 'output_transcription') and event.server_content.output_transcription:
+                    logger.info(f"[TRANSCRIPTION-OUTPUT] Agent: {event.server_content.output_transcription.text}")
+            
             # Log every event with content
             if event.content and event.content.parts:
                 for i, part in enumerate(event.content.parts):
@@ -451,6 +459,11 @@ async def websocket_endpoint(
             
             # Send original event to client as well
             event_json = event.model_dump_json(exclude_none=True, by_alias=True)
+            
+            # ✅ NEW: Log a sample to verify field names in JSON
+            if hasattr(event, 'server_content') and event.server_content:
+                logger.debug(f"[TRANSCRIPTION-JSON-SAMPLE] Sending event with serverContent fields")
+            
             logger.debug(f"Sending event to client")
             try:
                 await websocket.send_text(event_json)
