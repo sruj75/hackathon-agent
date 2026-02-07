@@ -467,9 +467,9 @@ async def websocket_endpoint(
 
 if __name__ == "__main__":
     import uvicorn
-    # Get host and port from environment variables
-    host = os.getenv("BACKEND_HOST")
-    port = int(os.getenv("BACKEND_PORT"))
+    # Get host and port from environment variables with defaults
+    host = os.getenv("BACKEND_HOST", "0.0.0.0")
+    port = int(os.getenv("BACKEND_PORT", "8000"))
     
     logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
