@@ -1,74 +1,52 @@
 # Agent Tests
 
-Unit tests for the Intentive agent backend.
+Last validated: **February 7, 2026**  
+Status: **115 tests passing**
 
 ## Setup
 
-Install test dependencies:
-
 ```bash
+cd agent
 pip install -r requirements-test.txt
 ```
 
-## Running Tests
-
-Run all tests:
+## Run
 
 ```bash
+cd agent
 pytest
 ```
 
-Run specific test file:
+## Integration Only
 
 ```bash
-pytest tests/test_notification_service.py
+cd agent
+pytest -m integration
 ```
 
-Run with verbose output:
+## Regression Only
 
 ```bash
-pytest -v
+cd agent
+pytest -m regression
 ```
 
-Run with coverage:
+## Suite Map (Current)
 
-```bash
-pytest --cov=. --cov-report=html
-```
+- `test_database_layer.py` - repos/models persistence
+- `test_session_manager.py` - session lifecycle and restore behavior
+- `test_cron_service.py` - cron job create/delete/error handling
+- `test_agent_runtime.py` - thinking/conversation mode runtime behavior
+- `test_api_endpoints.py` - `/health`, `/api/save-token`, `/api/execute-event/*`
+- `test_notification_service.py` - push sending + token invalidation
+- `test_phase1_regression.py` - phase 1 safety net
+- `test_phase2_regression.py` - phase 2 safety net
+- `test_phase6_regression.py` - phase 6 WebSocket init/UI forwarding guards
+- `test_integration_flows.py` - end-to-end morning/checkin/day cycle flows
 
-## Test Structure
+## Scope Rule
 
-### test_notification_service.py
-
-Tests for push notification functionality:
-
-- ✅ Mock Expo API interactions
-- ✅ Token retrieval from database
-- ✅ Error handling (DeviceNotRegistered, timeouts, API errors)
-- ✅ Payload format verification
-- ✅ Token deletion on invalid device
-
-## Writing New Tests
-
-Follow these patterns:
-
-1. Use `@pytest.mark.asyncio` for async tests
-2. Mock external dependencies (httpx, database)
-3. Test success cases and all error paths
-4. Verify side effects (database calls, logging)
-
-Example:
-
-```python
-@pytest.mark.asyncio
-async def test_my_feature(mock_db):
-    # Setup
-    mock_db.execute.return_value = expected_result
-    
-    # Execute
-    result = await my_function(mock_db)
-    
-    # Verify
-    assert result == expected_value
-    mock_db.execute.assert_called_once()
-```
+Keep each new test focused:
+- one primary behavior
+- one regression assertion
+- external dependencies mocked unless explicitly integration-scoped

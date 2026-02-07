@@ -18,6 +18,9 @@ from sqlalchemy.pool import StaticPool
 # Set test environment
 os.environ['ENVIRONMENT'] = 'test'
 os.environ['DATABASE_URL'] = 'sqlite+aiosqlite:///:memory:'
+# Keep composio cache in a writable location during tests.
+os.environ.setdefault('COMPOSIO_CACHE_DIR', '/tmp/composio-cache')
+os.makedirs(os.environ['COMPOSIO_CACHE_DIR'], exist_ok=True)
 
 from database import Base, get_db
 from models import UserProfile, UserPushToken, AgentSession, ScheduledEvent

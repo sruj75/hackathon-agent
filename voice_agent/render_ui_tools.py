@@ -31,13 +31,14 @@ def generative_ui(component: str, props = None):
     Render a UI component to the user.
     
     Components:
-    - day_view: Unified view (tasks + events together)
-    - todo_list: Task list only
-    - calendar_view: Calendar only
+    - day_view: Enhanced unified executive control panel
+      Shows events, tasks, and contextual intelligence (current block, focus mode, etc.)
     
     Args:
-        component: Component type (day_view, todo_list, calendar_view)
+        component: Component type (only "day_view" for MVP)
         props: Component properties with data to display
+            Core fields: events, tasks
+            Optional contextual fields: current_block, next_checkin, focus_mode, urgency_signals
         
     Returns:
         {
@@ -53,7 +54,9 @@ def generative_ui(component: str, props = None):
         props = {}
     
     valid_components = [
-        "day_view", "todo_list", "calendar_view"
+        "day_view",  # ONLY component for MVP
+        # "todo_list",     # REMOVED - redundant subset of day_view
+        # "calendar_view"  # REMOVED - redundant subset of day_view
     ]
     
     if component not in valid_components:

@@ -329,7 +329,7 @@ class TestExecuteEventEndpoint:
 
     @pytest.mark.asyncio
     async def test_execute_event_trigger_context_format(self, test_db, test_user, test_event):
-        """Test that trigger context is properly formatted."""
+        """Test that execute_event uses the phase-4 minimal trigger context."""
         captured_context = None
         
         async def mock_run(user_id, trigger_context, **kwargs):
@@ -342,7 +342,8 @@ class TestExecuteEventEndpoint:
                 async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                     await ac.post(f"/api/execute-event/{test_event.id}")
         
-        # Verify trigger context contains event details
+        # Regression guard:
+        # Phase 4 intentionally uses a minimal trigger prompt and lets the
+        # agent gather context via tools.
         assert captured_context is not None
-        assert test_event.event_type in captured_context
-        assert "SYSTEM_TRIGGER" in captured_context
+        assert captured_context == "You just woke up."
