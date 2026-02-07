@@ -1,0 +1,11 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // v0 Testing Rules - Public access for TestFlight
+    // No authentication in v0 (single hardcoded user for testing)
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

@@ -43,18 +43,7 @@ BACKEND_URL=https://your-app.onrender.com  # Production URL
 - For production on Render, use your actual deployment URL (e.g., `https://intentive-backend.onrender.com`)
 - cron-jobs.org needs to be able to reach this URL via HTTP/HTTPS
 
-### 3. Database Migration (Already Applied)
-
-The migration has been applied automatically. To verify:
-
-```bash
-cd agent
-alembic current
-```
-
-You should see migration `a649a935709e` (add_cron_job_id_to_events).
-
-### 4. Testing
+### 3. Testing
 
 Run the test suite to verify everything works:
 
@@ -135,13 +124,6 @@ For v0 usage:
 - Check logs for cleanup errors
 - Manually delete via cron-jobs.org console
 - Non-critical: Job will expire automatically via `expiresAt`
-
-### Migration Issues
-```bash
-cd agent
-alembic downgrade -1  # Rollback if needed
-alembic upgrade head  # Reapply
-```
 
 ## Development vs Production
 

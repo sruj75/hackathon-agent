@@ -1,7 +1,6 @@
 import logging
 import json
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
 from repos import user_repo
 
 logger = logging.getLogger(__name__)
@@ -9,7 +8,6 @@ logger = logging.getLogger(__name__)
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 async def send_push_notification(
-    db: AsyncSession,
     user_id: str,
     title: str,
     body: str,
@@ -19,7 +17,6 @@ async def send_push_notification(
     Send push notification to user's device via Expo Push API.
     
     Args:
-        db: Database session
         user_id: User identifier
         title: Notification title
         body: Notification message
@@ -33,7 +30,7 @@ async def send_push_notification(
     
     try:
         # 1. Get user's Expo push token from DB
-        push_token = await user_repo.get_push_token(db, user_id)
+        push_token = await user_repo.get_push_token(user_id)
         
         if not push_token:
             logger.warning(f"[PUSH NOTIFICATION] No push token found for user {user_id}")
@@ -78,7 +75,7 @@ async def send_push_notification(
                                     f"[PUSH NOTIFICATION] Device not registered for user {user_id}, "
                                     f"deleting invalid token"
                                 )
-                                await delete_push_token(db, user_id)
+                                await delete_push_token(user_id)
                                 return False
                             
                             logger.error(
@@ -102,18 +99,10 @@ async def send_push_notification(
         logger.error(f"[PUSH NOTIFICATION] Error sending to user {user_id}: {e}")
         return False
 
-async def delete_push_token(db: AsyncSession, user_id: str) -> None:
+async def delete_push_token(user_id: str) -> None:
     """Delete invalid push token from database."""
     try:
-        # Import here to avoid circular dependency
-        from sqlalchemy import delete
-        from models import UserPushToken
-        
-        await db.execute(
-            delete(UserPushToken).where(UserPushToken.user_id == user_id)
-        )
-        await db.commit()
+        await user_repo.delete_push_token(user_id)
         logger.info(f"[PUSH NOTIFICATION] Deleted push token for user {user_id}")
     except Exception as e:
         logger.error(f"[PUSH NOTIFICATION] Error deleting token for user {user_id}: {e}")
-        await db.rollback()

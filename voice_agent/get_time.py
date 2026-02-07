@@ -3,7 +3,6 @@ import pytz
 from .composio_tools import _get_user_timezone
 from context import current_user_id
 from repos import user_repo
-from database import SessionLocal
 import logging
 
 logger = logging.getLogger(__name__)
@@ -55,26 +54,25 @@ async def get_user_preferences() -> dict:
     try:
         user_id = current_user_id.get()
         
-        async with SessionLocal() as db:
-            profile = await user_repo.get_profile(db, user_id)
-            
-            if not profile:
-                # Return defaults if no profile exists yet
-                logger.info(f"No profile found for user {user_id}, returning defaults")
-                return {
-                    "wake_time": "07:00",
-                    "bedtime": "22:00",
-                    "timezone": _get_user_timezone(),
-                    "health_anchors": []
-                }
-            
+        profile = await user_repo.get_profile(user_id)
+        
+        if not profile:
+            # Return defaults if no profile exists yet
+            logger.info(f"No profile found for user {user_id}, returning defaults")
             return {
-                "wake_time": profile.wake_time,
-                "bedtime": profile.bedtime,
-                "timezone": profile.timezone,
-                "health_anchors": profile.health_anchors or []
+                "wake_time": "07:00",
+                "bedtime": "22:00",
+                "timezone": _get_user_timezone(),
+                "health_anchors": []
             }
-            
+        
+        return {
+            "wake_time": profile.wake_time,
+            "bedtime": profile.bedtime,
+            "timezone": profile.timezone,
+            "health_anchors": profile.health_anchors or []
+        }
+        
     except Exception as e:
         logger.error(f"Error getting user preferences: {e}", exc_info=True)
         return {

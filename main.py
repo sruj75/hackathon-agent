@@ -36,8 +36,6 @@ from context import current_session_id, current_user_id
 
 # New imports for Cron Endpoints
 from fastapi import Header, HTTPException, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from database import get_db, SessionLocal
 from repos import event_repo, user_repo
 from datetime import datetime, timedelta, time
 import os
@@ -104,8 +102,7 @@ async def health():
 
 @app.post("/api/execute-event/{event_id}")
 async def execute_event(
-    event_id: str,
-    db: AsyncSession = Depends(get_db)
+    event_id: str
 ):
     """
     Execute a specific scheduled event.
@@ -113,7 +110,7 @@ async def execute_event(
     
     Security: Event IDs are UUIDs (unguessable) and execution is idempotent.
     """
-    event = await event_repo.get_by_id(db, event_id)
+    event = await event_repo.get_by_id(event_id)
     
     # Null check: if event doesn't exist, return 404
     if event is None:
@@ -140,8 +137,7 @@ async def execute_event(
         async for agent_event in AgentRuntime.run_thinking_mode(
             user_id=event.user_id,
             trigger_context=trigger_prompt,
-            session_manager=session_manager,
-            db=db
+            session_manager=session_manager
         ):
             # Log significant events
             if hasattr(agent_event, "content") and agent_event.content and agent_event.content.parts:
@@ -156,7 +152,7 @@ async def execute_event(
         # Don't re-raise, we still want to mark event as executed so we don't loop forever
     
     # Mark event as executed
-    await event_repo.mark_executed(db, event_id)
+    await event_repo.mark_executed(event_id)
     
     # Cleanup: Delete the cron job from cron-jobs.org
     if event.cron_job_id:
@@ -170,8 +166,7 @@ async def execute_event(
 
 @app.post("/api/save-token")
 async def save_push_token(
-    payload: dict,
-    db: AsyncSession = Depends(get_db)
+    payload: dict
 ):
     """
     Saves the user's Expo push token.
@@ -189,100 +184,20 @@ async def save_push_token(
     if not re.match(r'^ExponentPushToken\[.+\]$', token):
         raise HTTPException(status_code=400, detail="Invalid token format")
         
-    await user_repo.save_push_token(db, user_id, token)
+    await user_repo.save_push_token(user_id, token)
     return {"status": "saved", "user_id": user_id}
 
 
-@app.on_event("startup")
-async def schedule_morning_wakes():
-    """
-    Heartbeat Logic:
-    On server startup, ensure every user has a morning_wake event scheduled for tomorrow.
-    This guarantees the 'Agent Loop' restarts even if the server crashed overnight.
-    Idempotent: Checks for existence before creating.
-    """
-    logger.info("🌅 [STARTUP] Checking morning wake schedules...")
-    async with SessionLocal() as db:
-        users = await user_repo.get_all_users(db)
-        count = 0
-        for user in users:
-            # Logic: Schedule for TOMORROW morning
-            tomorrow = (datetime.now() + timedelta(days=1)).date()
-            
-            # Default to 08:00 if user has no preference
-            wake_fmt = user.wake_time or "08:00"
-            try:
-                wake_time_obj = time.fromisoformat(wake_fmt)
-            except ValueError:
-                wake_time_obj = time(8, 0) # Fallback safe default
-                
-            # Combine into naive datetime (repo handles storage)
-            wake_dt = datetime.combine(tomorrow, wake_time_obj)
-            
-            # Check if exists (Idempotency)
-            existing = await event_repo.get_event_by_type_and_time(
-                db, user.user_id, "morning_wake", wake_dt
-            )
-            
-            if not existing:
-                # Create event
-                event = await event_repo.create_event(
-                    db, 
-                    user.user_id, 
-                    wake_dt, 
-                    "morning_wake", 
-                    payload={
-                        "title": "Good Morning! ☀️",
-                        "body": "Time to design your day. Ready to start?"
-                    }
-                )
-                
-                # Create corresponding cron job
-                try:
-                    import pytz
-                    tz_name = user.timezone or "UTC"
-                    wake_dt_aware = pytz.timezone(tz_name).localize(wake_dt)
-                    
-                    cron_job_id = await cron_service.create_one_time_job(
-                        target_datetime=wake_dt_aware,
-                        event_id=event.id,
-                        timezone=tz_name
-                    )
-                    
-                    await event_repo.update_cron_job_id(db, event.id, cron_job_id)
-                    count += 1
-                    logger.info(f"   ✅ Scheduled wake for {user.user_id} at {wake_dt} (cron job {cron_job_id})")
-                    
-                except Exception as cron_error:
-                    logger.error(f"   ❌ Failed to create cron job for {user.user_id}: {cron_error}")
-                    # Delete the event since we couldn't create the cron job
-                    await db.delete(event)
-                    await db.commit()
-                    
-            elif existing and not existing.cron_job_id:
-                # Event exists but has no cron job (recovery from old polling system)
-                logger.info(f"   🔧 Recovering cron job for existing event {existing.id}")
-                try:
-                    import pytz
-                    tz_name = user.timezone or "UTC"
-                    wake_dt_aware = pytz.timezone(tz_name).localize(wake_dt)
-                    
-                    cron_job_id = await cron_service.create_one_time_job(
-                        target_datetime=wake_dt_aware,
-                        event_id=existing.id,
-                        timezone=tz_name
-                    )
-                    
-                    await event_repo.update_cron_job_id(db, existing.id, cron_job_id)
-                    logger.info(f"   ✅ Recovered cron job {cron_job_id} for {user.user_id}")
-                    
-                except Exception as cron_error:
-                    logger.error(f"   ❌ Failed to recover cron job for {user.user_id}: {cron_error}")
-                    
-            else:
-                logger.info(f"   Note: Wake already scheduled for {user.user_id}")
-                
-        logger.info(f"🌅 [STARTUP] Complete. Scheduled {count} new wake events.")
+# @app.on_event("startup")
+# async def schedule_morning_wakes():
+#     """
+#     Heartbeat Logic:
+#     On server startup, ensure every user has a morning_wake event scheduled for tomorrow.
+#     This guarantees the 'Agent Loop' restarts even if the server crashed overnight.
+#     Idempotent: Checks for existence before creating.
+#     """
+#     # Commented out during Firestore migration
+#     pass
 
 
 @app.websocket("/ws/{user_id}/{session_id}")

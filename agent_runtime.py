@@ -8,7 +8,7 @@ from google.adk.runners import Runner
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import types
 
-from context import current_user_id, current_session_id, current_db
+from context import current_user_id, current_session_id
 from session_manager import ADKSessionManager
 from voice_agent.agent import thinking_agent, conversation_agent
 
@@ -30,8 +30,7 @@ class AgentRuntime:
     async def run_thinking_mode(
         user_id: str, 
         trigger_context: str, 
-        session_manager: ADKSessionManager,
-        db = None
+        session_manager: ADKSessionManager
     ) -> AsyncGenerator[types.GenerateContentResponse, None]:
         """
         Executes a single turn of the agent in "Thinking Mode" (Text).
@@ -44,8 +43,6 @@ class AgentRuntime:
         # 2. Set Context
         current_user_id.set(user_id)
         current_session_id.set(session_id)
-        if db is not None:
-            current_db.set(db)
         
         # 3. Initialize Session (Load RAM + DB)
         await session_manager.get_or_create_session(
@@ -90,13 +87,13 @@ class AgentRuntime:
             )
             
             # Sync ADK events to state for persistence
-            # We explicitly save the event history into the state dict so it persists in SQLite
+            # We explicitly save the event history into the state dict so it persists in Firestore
             if hasattr(latest_session, 'events'):
                  latest_session.state['history'] = [
                      event.model_dump(mode='json') for event in latest_session.events
                  ]
             
-            # 7. Save to DB
+            # 7. Save to Firestore
             await session_manager.save_agent_session_to_db(session_id, latest_session.state, user_id=user_id)
 
     @staticmethod

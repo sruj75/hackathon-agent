@@ -2,9 +2,7 @@ from typing import Optional, Dict, Any
 import logging
 from datetime import datetime
 from google.adk.sessions import InMemorySessionService, Session
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import SessionLocal
 from repos import session_repo
 
 logger = logging.getLogger(__name__)
@@ -74,8 +72,7 @@ class ADKSessionManager:
         user_id: Optional[str] = None
     ) -> bool:
         """
-        Syncs in-memory state to SQLite via repo.
-        Uses its own DB session scope.
+        Syncs in-memory state to Firestore via repo.
         
         Args:
             session_id: Session identifier
@@ -85,35 +82,26 @@ class ADKSessionManager:
         """
         # Ensure user_id is available either from arg or state
         u_id = user_id or state.get("user_id")
-        
-        # If user_id is missing and we're just saving state updates for an existing session,
-        # session_repo.upsert_session logic handles this if creation isn't triggered.
-        # But if creation IS triggered, it will fail without user_id.
-        # It's better to provide a default or error if critical.
-        # For robustness, we default date to today.
-        
         date_str = state.get("date", datetime.now().strftime("%Y-%m-%d"))
 
-        async with SessionLocal() as db:
-            try:
-                if u_id:
-                     # Use upsert which handles creation safely
-                     await session_repo.upsert_session(
-                         db, 
-                         session_id=session_id, 
-                         user_id=u_id, 
-                         date=date_str, 
-                         state=state
-                     )
-                else:
-                     # Fallback to save_session which relies on state having user_id if new
-                     await session_repo.save_session(db, session_id, state)
-                     
-                logger.debug(f"Saved session {session_id} to DB.")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to save session {session_id}: {e}")
-                return False
+        try:
+            if u_id:
+                 # Use upsert which handles creation safely
+                 await session_repo.upsert_session(
+                     session_id=session_id, 
+                     user_id=u_id, 
+                     date=date_str, 
+                     state=state
+                 )
+            else:
+                 # Fallback to save_session which relies on state having user_id if new
+                 await session_repo.save_session(session_id, state)
+                 
+            logger.debug(f"Saved session {session_id} to DB.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save session {session_id}: {e}")
+            return False
 
     async def restore_session_from_db(
         self, 
@@ -122,7 +110,7 @@ class ADKSessionManager:
         user_id: str
     ) -> Optional[Session]:
         """
-        Loads session from SQLite and injects into RAM.
+        Loads session from Firestore and injects into RAM.
         
         Args:
             app_name: ADK App Name
@@ -132,24 +120,23 @@ class ADKSessionManager:
         Returns:
             Session object if found and restored, else None.
         """
-        async with SessionLocal() as db:
-            try:
-                db_session = await session_repo.get_session(db, session_id)
-                if not db_session:
-                    return None
-                
-                # Create session in memory with restored state
-                # Note: db_session.state is a dict
-                session = await self.service.create_session(
-                    app_name=app_name,
-                    user_id=user_id,
-                    session_id=session_id,
-                    state=db_session.state
-                )
-                return session
-            except Exception as e:
-                logger.error(f"Failed to restore session {session_id}: {e}")
+        try:
+            db_session = await session_repo.get_session(session_id)
+            if not db_session:
                 return None
+            
+            # Create session in memory with restored state
+            # Note: db_session.state is a dict
+            session = await self.service.create_session(
+                app_name=app_name,
+                user_id=user_id,
+                session_id=session_id,
+                state=db_session.state
+            )
+            return session
+        except Exception as e:
+            logger.error(f"Failed to restore session {session_id}: {e}")
+            return None
 
     @staticmethod
     def get_daily_session_id(user_id: str) -> str:
