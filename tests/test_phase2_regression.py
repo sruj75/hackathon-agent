@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 import cron_service
-from context import current_db, current_session_id, current_user_id
+from context import current_session_id, current_user_id
 from repos import event_repo
 
 
@@ -20,11 +20,9 @@ from repos import event_repo
 async def test_phase2_context_vars_are_settable(test_db, test_user):
     current_user_id.set(test_user.user_id)
     current_session_id.set("phase2_session")
-    current_db.set(test_db)
 
     assert current_user_id.get() == test_user.user_id
     assert current_session_id.get() == "phase2_session"
-    assert current_db.get() == test_db
 
 
 @pytest.mark.regression
@@ -60,7 +58,6 @@ async def test_phase2_cron_missing_api_key_errors_cleanly():
 @pytest.mark.asyncio
 async def test_phase2_event_cron_link_lifecycle(test_db, test_user):
     event = await event_repo.create_event(
-        db=test_db,
         user_id=test_user.user_id,
         scheduled_time=datetime.utcnow() + timedelta(minutes=20),
         event_type="checkin",
@@ -68,10 +65,10 @@ async def test_phase2_event_cron_link_lifecycle(test_db, test_user):
     )
     assert event.cron_job_id is None
 
-    await event_repo.update_cron_job_id(test_db, event.id, 99999)
-    await event_repo.mark_executed(test_db, event.id)
+    await event_repo.update_cron_job_id(event.id, 99999)
+    await event_repo.mark_executed(event.id)
 
-    updated = await event_repo.get_by_id(test_db, event.id)
+    updated = await event_repo.get_by_id(event.id)
     assert updated is not None
     assert updated.cron_job_id == 99999
     assert updated.executed is True

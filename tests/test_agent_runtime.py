@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from freezegun import freeze_time
 
 from agent_runtime import AgentRuntime
-from context import current_user_id, current_session_id, current_db
+from context import current_user_id, current_session_id
 from models import UserProfile
 
 
@@ -44,7 +44,6 @@ class TestAgentRuntime:
             # Verify context variables were set
             assert current_user_id.get() == test_user.user_id
             assert current_session_id.get() == f"session_{test_user.user_id}_{datetime.now().date().isoformat()}"
-            assert current_db.get() == test_db
 
     @pytest.mark.asyncio
     async def test_thinking_mode_generates_session_id(self, test_db, test_user, mock_session_manager):

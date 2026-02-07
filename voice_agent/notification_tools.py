@@ -1,5 +1,5 @@
 from notification_service import send_push_notification
-from context import current_user_id, current_session_id, current_db
+from context import current_user_id, current_session_id
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,15 +25,10 @@ async def send_push_notification_tool(
     """
     user_id = current_user_id.get()
     session_id = current_session_id.get()
-    db = current_db.get()
     
     if not user_id:
         logger.error("[send_push_notification_tool] No current user context found")
         return "Error: No current user context found."
-    
-    if not db:
-        logger.error("[send_push_notification_tool] No database session found")
-        return "Error: No database session available."
     
     if not session_id:
         logger.warning("[send_push_notification_tool] No session_id found - notification will not support conversation resume")
@@ -50,7 +45,7 @@ async def send_push_notification_tool(
         "user_id": user_id
     }
     
-    success = await send_push_notification(db, user_id, title, body, data)
+    success = await send_push_notification(user_id, title, body, data)
     
     if success:
         return f"✅ Notification sent: {title}"

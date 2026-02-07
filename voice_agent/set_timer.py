@@ -4,7 +4,7 @@ Used only in Thinking Mode to schedule future interventions.
 """
 from datetime import datetime, timedelta
 import pytz
-from context import current_user_id, current_session_id, current_db
+from context import current_user_id, current_session_id
 from repos import event_repo
 import cron_service
 from .composio_tools import _get_user_timezone
@@ -34,10 +34,9 @@ async def set_checkin_timer(
     """
     user_id = current_user_id.get()
     session_id = current_session_id.get()
-    db = current_db.get()
     
-    if not user_id or not db:
-        logger.error("[set_checkin_timer] Missing context (user_id or db)")
+    if not user_id:
+        logger.error("[set_checkin_timer] Missing context (user_id)")
         return "Error: Cannot set timer - missing context."
     
     try:
@@ -49,7 +48,6 @@ async def set_checkin_timer(
         
         # Create event in database
         event = await event_repo.create_event(
-            db,
             user_id,
             scheduled_time,
             "checkin",
@@ -64,7 +62,7 @@ async def set_checkin_timer(
         )
         
         # Update event with cron job ID
-        await event_repo.update_cron_job_id(db, event.id, cron_job_id)
+        await event_repo.update_cron_job_id(event.id, cron_job_id)
         
         logger.info(
             f"[set_checkin_timer] Scheduled check-in for {user_id} at {scheduled_time.strftime('%I:%M %p')} "
