@@ -43,6 +43,20 @@ async def update_cron_job_id(event_id: str, cron_job_id: int) -> bool:
     return True
 
 
+async def update_event(event_id: str, **kwargs) -> bool:
+    """Update arbitrary fields for an event."""
+    db = get_firestore()
+    doc_ref = db.collection("events").document(event_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        return False
+
+    update_data = {**kwargs, "updated_at": datetime.utcnow()}
+    doc_ref.update(update_data)
+    return True
+
+
 async def mark_executed(event_id: str) -> None:
     """Mark an event as executed."""
     db = get_firestore()

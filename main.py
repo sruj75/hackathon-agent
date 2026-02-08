@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,7 +41,7 @@ from google.genai import types
 from context import current_session_id, current_user_id, current_user_timezone
 
 # New imports for Cron Endpoints
-from fastapi import Header, HTTPException, Depends
+from fastapi import HTTPException
 from repos import event_repo, user_repo
 from datetime import datetime, timedelta, time, timezone
 from agent_runtime import AgentRuntime
@@ -52,6 +53,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+HHMM_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 def _event_field(event: object, field: str, default=None):
@@ -115,6 +118,10 @@ def _ordered_conversation_models() -> list[str]:
     return candidates
 
 
+def _is_valid_hhmm(value: str | None) -> bool:
+    return bool(value and HHMM_PATTERN.match(value))
+
+
 def _parse_wake_time(wake_time_raw: str | None) -> tuple[int, int] | None:
     """Parse HH:MM wake-time strings. Returns None when missing/invalid."""
     if not wake_time_raw:
@@ -128,6 +135,79 @@ def _parse_wake_time(wake_time_raw: str | None) -> tuple[int, int] | None:
         return (hour, minute)
     except Exception:
         return None
+
+
+def _validate_profile_for_scheduler(profile: dict | None) -> tuple[bool, list[str]]:
+    """Validate required profile fields before creating scheduled wake events."""
+    profile = profile or {}
+    errors: list[str] = []
+
+    if not profile.get("user_id"):
+        errors.append("missing_user_id")
+
+    wake_time = profile.get("wake_time")
+    if not _is_valid_hhmm(wake_time):
+        errors.append("invalid_wake_time")
+
+    timezone_name = profile.get("timezone")
+    if not timezone_name:
+        errors.append("missing_timezone")
+    else:
+        try:
+            ZoneInfo(timezone_name)
+        except Exception:
+            errors.append("invalid_timezone")
+
+    return (len(errors) == 0, errors)
+
+
+def _normalize_health_anchors(value: object) -> list[str]:
+    """Normalize health anchors to a clean string list."""
+    if not isinstance(value, list):
+        return []
+    return [
+        anchor.strip()
+        for anchor in value
+        if isinstance(anchor, str) and anchor.strip()
+    ]
+
+
+def _validate_preferences_payload(payload: dict) -> tuple[dict, list[str]]:
+    """Validate and sanitize incoming user preference payload."""
+    errors: list[str] = []
+
+    wake_time = payload.get("wake_time")
+    bedtime = payload.get("bedtime")
+    timezone_name = payload.get("timezone")
+    health_anchors = _normalize_health_anchors(payload.get("health_anchors"))
+
+    if not _is_valid_hhmm(wake_time):
+        errors.append("wake_time must be HH:MM in 24-hour format")
+    if not _is_valid_hhmm(bedtime):
+        errors.append("bedtime must be HH:MM in 24-hour format")
+
+    if not timezone_name or not isinstance(timezone_name, str):
+        errors.append("timezone is required")
+    else:
+        try:
+            ZoneInfo(timezone_name)
+        except Exception:
+            errors.append("timezone must be a valid IANA timezone")
+
+    sanitized = {
+        "wake_time": wake_time,
+        "bedtime": bedtime,
+        "timezone": timezone_name,
+        "health_anchors": health_anchors,
+    }
+    return sanitized, errors
+
+
+def _profile_is_complete(profile: dict | None) -> bool:
+    if not profile:
+        return False
+    valid_scheduler_profile, _ = _validate_profile_for_scheduler(profile)
+    return valid_scheduler_profile
 
 
 def _normalize_timezone(timezone_name: str | None, fallback: str = "UTC") -> str:
@@ -175,14 +255,19 @@ def _as_datetime(value) -> datetime | None:
 async def _ensure_morning_wake_for_user(user: dict) -> None:
     """
     Ensure exactly one pending morning wake event exists for user's next wake date.
-    Creates event + cron if missing; backfills cron if event exists without cron id.
+    Creates event + cron if missing; backfills/reschedules cron for existing events.
     """
-    user_id = user.get("user_id")
-    if not user_id:
+    is_valid, validation_errors = _validate_profile_for_scheduler(user)
+    if not is_valid:
+        logger.warning(
+            f"[morning-bootstrap] Skipping morning wake due to invalid profile "
+            f"user_id={(user or {}).get('user_id')}: errors={validation_errors}"
+        )
         return
 
-    user_timezone = _normalize_timezone(user.get("timezone"), "UTC")
-    wake_time_raw = user.get("wake_time")
+    user_id = str(user.get("user_id"))
+    user_timezone = str(user.get("timezone"))
+    wake_time_raw = str(user.get("wake_time"))
     target_local = _next_morning_wake_datetime(user_timezone, wake_time_raw)
     if not target_local:
         logger.warning(
@@ -194,23 +279,53 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
 
     existing = await event_repo.find_pending_morning_event(user_id, seed_date)
     if existing:
-        if not _event_field(existing, "cron_job_id"):
-            event_id = _event_field(existing, "id")
-            if not event_id:
-                logger.warning(
-                    f"[morning-bootstrap] Existing event missing id for user {user_id}, seed_date={seed_date}"
-                )
-                return
-            scheduled_time = _as_datetime(_event_field(existing, "scheduled_time")) or target_local
+        event_id = _event_field(existing, "id")
+        if not event_id:
+            logger.warning(
+                f"[morning-bootstrap] Existing event missing id for user {user_id}, seed_date={seed_date}"
+            )
+            return
+
+        existing_scheduled = _as_datetime(_event_field(existing, "scheduled_time"))
+        existing_payload = _event_field(existing, "payload", {}) or {}
+        existing_cron_job_id = _event_field(existing, "cron_job_id")
+
+        # Reschedule when wake time/timezone changed, or when cron id is missing.
+        should_reschedule = (
+            not existing_cron_job_id
+            or not existing_scheduled
+            or abs((existing_scheduled - target_local).total_seconds()) >= 60
+            or _normalize_timezone(existing_payload.get("timezone"), "") != user_timezone
+        )
+
+        if should_reschedule:
+            if existing_cron_job_id:
+                try:
+                    await cron_service.delete_job(existing_cron_job_id)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"[morning-bootstrap] Failed to cleanup previous cron job {existing_cron_job_id}: {cleanup_error}"
+                    )
+
             cron_job_id = await cron_service.create_one_time_job(
-                target_datetime=scheduled_time,
+                target_datetime=target_local,
                 event_id=event_id,
                 timezone=user_timezone,
             )
-            await event_repo.update_cron_job_id(event_id, cron_job_id)
+            await event_repo.update_event(
+                event_id,
+                scheduled_time=target_local,
+                payload={
+                    "reason": "daily_bootstrap",
+                    "seed_date": seed_date,
+                    "timezone": user_timezone,
+                },
+                executed=False,
+                cron_job_id=cron_job_id,
+            )
             logger.info(
-                f"[morning-bootstrap] Backfilled cron for existing morning event user={user_id}, "
-                f"event_id={event_id}, cron_job_id={cron_job_id}"
+                f"[morning-bootstrap] Upserted cron for morning event user={user_id}, "
+                f"event_id={event_id}, wake={target_local.isoformat()}, cron_job_id={cron_job_id}"
             )
         return
 
@@ -292,6 +407,72 @@ async def root():
 async def health():
     """Health check for deployment monitoring."""
     return {"status": "healthy"}
+
+
+# ========================================
+# User Preferences Endpoints
+# ========================================
+
+@app.get("/api/preferences/{user_id}")
+async def get_user_preferences(user_id: str):
+    """Read persisted user preferences."""
+    profile = await user_repo.get_profile(user_id)
+    if not profile:
+        return {
+            "status": "not_found",
+            "user_id": user_id,
+            "preferences": None,
+            "is_complete": False,
+        }
+
+    preferences = {
+        "wake_time": profile.get("wake_time"),
+        "bedtime": profile.get("bedtime"),
+        "timezone": profile.get("timezone"),
+        "health_anchors": _normalize_health_anchors(profile.get("health_anchors")),
+    }
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "preferences": preferences,
+        "is_complete": _profile_is_complete(profile),
+    }
+
+
+@app.put("/api/preferences/{user_id}")
+async def update_user_preferences(user_id: str, payload: dict):
+    """Create/update user preferences and re-sync morning wake scheduling."""
+    sanitized, errors = _validate_preferences_payload(payload)
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    updated_profile = await user_repo.update_profile(user_id, **sanitized)
+
+    scheduler_error = None
+    try:
+        await _ensure_morning_wake_for_user(updated_profile)
+    except Exception as e:
+        scheduler_error = str(e)
+        logger.warning(
+            f"[preferences] Failed to resync morning wake for user {user_id}: {e}"
+        )
+
+    return {
+        "status": "ok" if scheduler_error is None else "partial_success",
+        "user_id": user_id,
+        "preferences": {
+            "wake_time": updated_profile.get("wake_time"),
+            "bedtime": updated_profile.get("bedtime"),
+            "timezone": updated_profile.get("timezone"),
+            "health_anchors": _normalize_health_anchors(
+                updated_profile.get("health_anchors")
+            ),
+        },
+        "scheduler": {
+            "resynced": scheduler_error is None,
+            "error": scheduler_error,
+        },
+    }
 
 
 # ========================================

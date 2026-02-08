@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 import main
 from session_manager import ADKSessionManager
@@ -333,3 +334,80 @@ class TestMorningWakeBootstrap:
         find_pending_mock.assert_not_awaited()
         create_event_mock.assert_not_awaited()
         create_cron_mock.assert_not_awaited()
+
+
+@pytest.mark.regression
+class TestPreferencesEndpoints:
+    @pytest.mark.asyncio
+    async def test_get_preferences_not_found(self, monkeypatch):
+        monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
+
+        async with AsyncClient(
+            transport=ASGITransport(app=main.app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/preferences/user_test")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "not_found"
+        assert body["user_id"] == "user_test"
+        assert body["is_complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_put_preferences_rejects_invalid_payload(self):
+        async with AsyncClient(
+            transport=ASGITransport(app=main.app),
+            base_url="http://test",
+        ) as client:
+            response = await client.put(
+                "/api/preferences/user_test",
+                json={
+                    "wake_time": "8am",
+                    "bedtime": "99:00",
+                    "timezone": "Not/A_Timezone",
+                    "health_anchors": [],
+                },
+            )
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "errors" in detail
+        assert len(detail["errors"]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_put_preferences_saves_and_resyncs_scheduler(self, monkeypatch):
+        updated_profile = {
+            "user_id": "user_test",
+            "wake_time": "07:30",
+            "bedtime": "22:15",
+            "timezone": "America/New_York",
+            "health_anchors": ["sleep", "lunch"],
+        }
+        update_profile_mock = AsyncMock(return_value=updated_profile)
+        resync_mock = AsyncMock(return_value=None)
+
+        monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
+        monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=main.app),
+            base_url="http://test",
+        ) as client:
+            response = await client.put(
+                "/api/preferences/user_test",
+                json={
+                    "wake_time": "07:30",
+                    "bedtime": "22:15",
+                    "timezone": "America/New_York",
+                    "health_anchors": ["sleep", "lunch"],
+                },
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["scheduler"]["resynced"] is True
+        assert body["preferences"]["wake_time"] == "07:30"
+        update_profile_mock.assert_awaited_once()
+        resync_mock.assert_awaited_once_with(updated_profile)

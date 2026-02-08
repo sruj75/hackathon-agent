@@ -14,16 +14,6 @@ from notification_service import send_push_notification, delete_push_token
 
 
 @pytest.fixture
-def mock_db():
-    """Mock database session."""
-    db = MagicMock()
-    db.execute = AsyncMock()
-    db.commit = AsyncMock()
-    db.rollback = AsyncMock()
-    return db
-
-
-@pytest.fixture
 def mock_user_repo():
     """Mock user repository."""
     with patch('notification_service.user_repo') as mock:
@@ -34,7 +24,7 @@ class TestNotificationService:
     """Test suite for notification service."""
 
     @pytest.mark.asyncio
-    async def test_send_notification_success(self, mock_db, mock_user_repo):
+    async def test_send_notification_success(self, mock_user_repo):
         """Test successful notification send."""
         # Setup
         mock_user_repo.get_push_token = AsyncMock(return_value="ExponentPushToken[test123]")
@@ -54,7 +44,6 @@ class TestNotificationService:
             
             # Execute
             result = await send_push_notification(
-                db=mock_db,
                 user_id="user_default",
                 title="Test",
                 body="Test message",
@@ -63,17 +52,16 @@ class TestNotificationService:
             
             # Verify
             assert result is True
-            mock_user_repo.get_push_token.assert_called_once_with(mock_db, "user_default")
+            mock_user_repo.get_push_token.assert_called_once_with("user_default")
 
     @pytest.mark.asyncio
-    async def test_send_notification_no_token(self, mock_db, mock_user_repo):
+    async def test_send_notification_no_token(self, mock_user_repo):
         """Test notification send when user has no token."""
         # Setup
         mock_user_repo.get_push_token = AsyncMock(return_value=None)
         
         # Execute
         result = await send_push_notification(
-            db=mock_db,
             user_id="user_default",
             title="Test",
             body="Test message"
@@ -84,7 +72,7 @@ class TestNotificationService:
         mock_user_repo.get_push_token.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_send_notification_device_not_registered(self, mock_db, mock_user_repo):
+    async def test_send_notification_device_not_registered(self, mock_user_repo):
         """Test handling of DeviceNotRegistered error."""
         # Setup
         mock_user_repo.get_push_token = AsyncMock(return_value="ExponentPushToken[test123]")
@@ -110,7 +98,6 @@ class TestNotificationService:
                 
                 # Execute
                 result = await send_push_notification(
-                    db=mock_db,
                     user_id="user_default",
                     title="Test",
                     body="Test message"
@@ -118,10 +105,10 @@ class TestNotificationService:
                 
                 # Verify
                 assert result is False
-                mock_delete.assert_called_once_with(mock_db, "user_default")
+                mock_delete.assert_called_once_with("user_default")
 
     @pytest.mark.asyncio
-    async def test_send_notification_expo_api_error(self, mock_db, mock_user_repo):
+    async def test_send_notification_expo_api_error(self, mock_user_repo):
         """Test handling of Expo API errors."""
         # Setup
         mock_user_repo.get_push_token = AsyncMock(return_value="ExponentPushToken[test123]")
@@ -139,7 +126,6 @@ class TestNotificationService:
             
             # Execute
             result = await send_push_notification(
-                db=mock_db,
                 user_id="user_default",
                 title="Test",
                 body="Test message"
@@ -149,7 +135,7 @@ class TestNotificationService:
             assert result is False
 
     @pytest.mark.asyncio
-    async def test_send_notification_timeout(self, mock_db, mock_user_repo):
+    async def test_send_notification_timeout(self, mock_user_repo):
         """Test handling of timeout errors."""
         # Setup
         mock_user_repo.get_push_token = AsyncMock(return_value="ExponentPushToken[test123]")
@@ -165,7 +151,6 @@ class TestNotificationService:
             
             # Execute
             result = await send_push_notification(
-                db=mock_db,
                 user_id="user_default",
                 title="Test",
                 body="Test message"
@@ -175,7 +160,7 @@ class TestNotificationService:
             assert result is False
 
     @pytest.mark.asyncio
-    async def test_payload_format(self, mock_db, mock_user_repo):
+    async def test_payload_format(self, mock_user_repo):
         """Test that notification payload has correct format."""
         # Setup
         mock_user_repo.get_push_token = AsyncMock(return_value="ExponentPushToken[test123]")
@@ -194,7 +179,6 @@ class TestNotificationService:
             
             # Execute
             await send_push_notification(
-                db=mock_db,
                 user_id="user_default",
                 title="Check-in",
                 body="How's it going?",
@@ -214,23 +198,19 @@ class TestNotificationService:
             assert payload['priority'] == "high"
 
     @pytest.mark.asyncio
-    async def test_delete_push_token(self, mock_db):
-        """Test token deletion."""
-        # Execute
-        await delete_push_token(mock_db, "user_default")
-        
-        # Verify
-        mock_db.execute.assert_called_once()
-        mock_db.commit.assert_called_once()
+    async def test_delete_push_token(self, mock_user_repo):
+        """Test token deletion delegates to user_repo."""
+        mock_user_repo.delete_push_token = AsyncMock(return_value=None)
+
+        await delete_push_token("user_default")
+
+        mock_user_repo.delete_push_token.assert_called_once_with("user_default")
 
     @pytest.mark.asyncio
-    async def test_delete_push_token_error(self, mock_db):
-        """Test token deletion error handling."""
-        # Setup
-        mock_db.execute.side_effect = Exception("DB Error")
-        
-        # Execute - should not raise
-        await delete_push_token(mock_db, "user_default")
-        
-        # Verify
-        mock_db.rollback.assert_called_once()
+    async def test_delete_push_token_error(self, mock_user_repo):
+        """Test token deletion error handling does not raise."""
+        mock_user_repo.delete_push_token = AsyncMock(side_effect=Exception("DB Error"))
+
+        await delete_push_token("user_default")
+
+        mock_user_repo.delete_push_token.assert_called_once_with("user_default")
