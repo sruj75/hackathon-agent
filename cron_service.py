@@ -6,6 +6,7 @@ enabling precise timer execution without polling.
 """
 import os
 import logging
+import asyncio
 from datetime import datetime, timedelta
 import httpx
 
@@ -68,36 +69,70 @@ async def create_one_time_job(
         "Content-Type": "application/json"
     }
     
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.put(
-                f"{CRONJOB_API_URL}/jobs",
-                json=payload,
-                headers=headers
+    max_attempts = int(os.getenv("CRONJOB_API_MAX_RETRIES", "3"))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.put(
+                    f"{CRONJOB_API_URL}/jobs",
+                    json=payload,
+                    headers=headers
+                )
+                response.raise_for_status()
+
+                result = response.json()
+                job_id = result.get("jobId")
+
+                if not job_id:
+                    raise ValueError(f"No jobId in response: {result}")
+
+                logger.info(
+                    f"✅ Created cron job {job_id} for event {event_id} "
+                    f"at {target_datetime.isoformat()} ({timezone})"
+                )
+
+                return job_id
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            response_text = (e.response.text or "").strip()
+            request_id = (
+                e.response.headers.get("X-Request-Id")
+                or e.response.headers.get("x-request-id")
+                or "unknown"
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            job_id = result.get("jobId")
-            
-            if not job_id:
-                raise ValueError(f"No jobId in response: {result}")
-            
-            logger.info(
-                f"✅ Created cron job {job_id} for event {event_id} "
-                f"at {target_datetime.isoformat()} ({timezone})"
+
+            # Retry on server-side cron-jobs.org failures.
+            if status >= 500 and attempt < max_attempts:
+                backoff_seconds = 2 ** (attempt - 1)
+                logger.warning(
+                    f"⚠️ Cron-jobs.org transient error (attempt {attempt}/{max_attempts}) "
+                    f"status={status}, request_id={request_id}, retrying in {backoff_seconds}s. "
+                    f"event_id={event_id}, timezone={timezone}, target={target_datetime.isoformat()}"
+                )
+                await asyncio.sleep(backoff_seconds)
+                continue
+
+            logger.error(
+                f"❌ Cron-jobs.org API error: status={status}, request_id={request_id}, body={response_text}"
             )
-            
-            return job_id
-            
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            f"❌ Cron-jobs.org API error: {e.response.status_code} - {e.response.text}"
-        )
-        raise Exception(f"Failed to create cron job: {e.response.text}")
-    except Exception as e:
-        logger.error(f"❌ Failed to create cron job: {e}")
-        raise
+            raise Exception(
+                f"Failed to create cron job (status={status}, request_id={request_id}): {response_text}"
+            )
+        except Exception as e:
+            if attempt < max_attempts:
+                backoff_seconds = 2 ** (attempt - 1)
+                logger.warning(
+                    f"⚠️ Failed to create cron job (attempt {attempt}/{max_attempts}): {e}. "
+                    f"Retrying in {backoff_seconds}s."
+                )
+                await asyncio.sleep(backoff_seconds)
+                continue
+
+            logger.error(f"❌ Failed to create cron job: {e}")
+            raise
+
+    raise Exception("Failed to create cron job after retries")
 
 
 async def delete_job(job_id: int) -> bool:

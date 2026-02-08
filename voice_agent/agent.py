@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 # Models
 # Conversation Mode: Gemini Live model (Live API / Audio)
 # Keep configurable to avoid hard failures when preview model names rotate.
-CONVERSATION_MODEL = os.getenv("CONVERSATION_MODEL", "gemini-live-2.5-flash-preview")
+# Default remains the model that is currently known to work with ADK live bidi
+# in this codebase/deployment setup.
+CONVERSATION_MODEL = os.getenv(
+    "CONVERSATION_MODEL",
+    "gemini-2.5-flash-native-audio-preview-09-2025",
+)
 # Thinking Mode: Standard API / Text
 THINKING_MODEL = os.getenv("THINKING_MODEL", "gemini-3-flash-preview")
 
