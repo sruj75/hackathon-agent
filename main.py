@@ -37,7 +37,7 @@ from session_manager import ADKSessionManager
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.genai import types
-from context import current_session_id, current_user_id
+from context import current_session_id, current_user_id, current_user_timezone
 
 # New imports for Cron Endpoints
 from fastapi import Header, HTTPException, Depends
@@ -115,27 +115,46 @@ def _ordered_conversation_models() -> list[str]:
     return candidates
 
 
-def _parse_wake_time(wake_time_raw: str | None) -> tuple[int, int]:
-    """Parse HH:MM wake-time strings with safe fallback."""
+def _parse_wake_time(wake_time_raw: str | None) -> tuple[int, int] | None:
+    """Parse HH:MM wake-time strings. Returns None when missing/invalid."""
     if not wake_time_raw:
-        return (8, 0)
+        return None
     try:
         hour_str, minute_str = wake_time_raw.strip().split(":", 1)
-        hour = max(0, min(23, int(hour_str)))
-        minute = max(0, min(59, int(minute_str)))
+        hour = int(hour_str)
+        minute = int(minute_str)
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
         return (hour, minute)
     except Exception:
-        return (8, 0)
+        return None
 
 
-def _next_morning_wake_datetime(user_timezone: str, wake_time_raw: str | None) -> datetime:
+def _normalize_timezone(timezone_name: str | None, fallback: str = "UTC") -> str:
+    """Return a valid IANA timezone or fallback."""
+    if not timezone_name:
+        return fallback
+    try:
+        ZoneInfo(timezone_name)
+        return timezone_name
+    except Exception:
+        logger.warning(f"Invalid timezone '{timezone_name}'. Falling back to {fallback}.")
+        return fallback
+
+
+def _next_morning_wake_datetime(
+    user_timezone: str, wake_time_raw: str | None
+) -> datetime | None:
     """
     Compute next local morning wake datetime for a user.
     If today's wake time already passed, schedule for tomorrow.
     """
     tz = ZoneInfo(user_timezone or "UTC")
     now_local = datetime.now(tz)
-    wake_hour, wake_minute = _parse_wake_time(wake_time_raw)
+    parsed_wake_time = _parse_wake_time(wake_time_raw)
+    if not parsed_wake_time:
+        return None
+    wake_hour, wake_minute = parsed_wake_time
     target_local = now_local.replace(
         hour=wake_hour, minute=wake_minute, second=0, microsecond=0
     )
@@ -162,9 +181,15 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
     if not user_id:
         return
 
-    user_timezone = user.get("timezone", "UTC")
+    user_timezone = _normalize_timezone(user.get("timezone"), "UTC")
     wake_time_raw = user.get("wake_time")
     target_local = _next_morning_wake_datetime(user_timezone, wake_time_raw)
+    if not target_local:
+        logger.warning(
+            f"[morning-bootstrap] Skipping morning wake for user {user_id}: "
+            f"missing/invalid wake_time='{wake_time_raw}'"
+        )
+        return
     seed_date = target_local.date().isoformat()
 
     existing = await event_repo.find_pending_morning_event(user_id, seed_date)
@@ -238,11 +263,12 @@ async def _reconcile_missing_cron_jobs() -> None:
             if not timezone_name:
                 profile = await user_repo.get_profile(_event_field(event, "user_id", ""))
                 timezone_name = (profile or {}).get("timezone", "UTC")
+            timezone_name = _normalize_timezone(timezone_name, "UTC")
 
             cron_job_id = await cron_service.create_one_time_job(
                 target_datetime=scheduled_time,
                 event_id=event_id,
-                timezone=timezone_name or "UTC",
+                timezone=timezone_name,
             )
             await event_repo.update_cron_job_id(event_id, cron_job_id)
             logger.info(
@@ -304,6 +330,17 @@ async def execute_event(
     event_type = _event_field(event, "event_type", "checkin")
     payload = _event_field(event, "payload", {}) or {}
     reason = payload.get("reason")
+    event_timezone = _normalize_timezone(payload.get("timezone"), fallback="")
+    if not event_timezone:
+        try:
+            profile = await user_repo.get_profile(_event_field(event, "user_id", ""))
+        except Exception as profile_error:
+            logger.warning(
+                f"[execute-event] Failed to load profile timezone for {_event_field(event, 'user_id', '')}: {profile_error}"
+            )
+            profile = None
+        event_timezone = _normalize_timezone((profile or {}).get("timezone"), "UTC")
+
     if event_type == "morning_wake":
         trigger_prompt = "You just woke up."
     else:
@@ -321,7 +358,8 @@ async def execute_event(
         async for agent_event in AgentRuntime.run_thinking_mode(
             user_id=event_user_id,
             trigger_context=trigger_prompt,
-            session_manager=session_manager
+            session_manager=session_manager,
+            timezone=event_timezone,
         ):
             # Log significant events
             if hasattr(agent_event, "content") and agent_event.content and agent_event.content.parts:
@@ -448,6 +486,14 @@ async def websocket_endpoint(
     session = await session_manager.get_or_create_session(
         app_name=APP_NAME, user_id=user_id, session_id=unified_session_id
     )
+    try:
+        profile = await user_repo.get_profile(user_id)
+    except Exception as profile_error:
+        logger.warning(f"[WS-INIT] Failed to load profile for {user_id}: {profile_error}")
+        profile = None
+    profile_timezone = _normalize_timezone((profile or {}).get("timezone"), "UTC")
+    current_user_timezone.set(profile_timezone)
+    session.state.setdefault("user_timezone", profile_timezone)
 
     live_request_queue = LiveRequestQueue()
     ws_model_candidates = _ordered_conversation_models()
@@ -509,13 +555,33 @@ async def websocket_endpoint(
                             init_handled = True
                             resume_session_id = json_message.get("resume_session_id")
                             trigger_type = json_message.get("trigger_type")
+                            client_timezone = _normalize_timezone(
+                                json_message.get("timezone"), profile_timezone
+                            )
                             
-                            logger.info(f"[WS-INIT] Received init handshake - resume_session_id: {resume_session_id}, trigger_type: {trigger_type}")
+                            logger.info(
+                                "[WS-INIT] Received init handshake - "
+                                f"resume_session_id: {resume_session_id}, "
+                                f"trigger_type: {trigger_type}, "
+                                f"timezone: {client_timezone}"
+                            )
                             
                             # Store trigger_type in session state for agent context
                             if trigger_type:
                                 session.state["trigger_type"] = trigger_type
                                 logger.info(f"[WS-INIT] Stored trigger_type in session: {trigger_type}")
+
+                            session.state["user_timezone"] = client_timezone
+                            current_user_timezone.set(client_timezone)
+                            try:
+                                await user_repo.update_profile(user_id, timezone=client_timezone)
+                                logger.info(
+                                    f"[WS-INIT] Stored user timezone in session/profile: {client_timezone}"
+                                )
+                            except Exception as profile_update_error:
+                                logger.warning(
+                                    f"[WS-INIT] Failed to persist timezone for {user_id}: {profile_update_error}"
+                                )
                             
                             # If explicit resume requested, update context variable
                             if resume_session_id and resume_session_id != unified_session_id:
@@ -713,7 +779,8 @@ async def websocket_endpoint(
             async for _ in AgentRuntime.run_thinking_mode(
                 user_id=user_id,
                 trigger_context=trigger_context,
-                session_manager=session_manager
+                session_manager=session_manager,
+                timezone=_normalize_timezone(session.state.get("user_timezone"), "UTC"),
             ):
                 pass  # We don't need to process the events, just let it run
             

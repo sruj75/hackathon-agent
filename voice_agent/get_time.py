@@ -45,32 +45,44 @@ async def get_user_preferences() -> dict:
     
     Returns:
         dict: {
-            "wake_time": "07:00",
-            "bedtime": "22:00",
-            "timezone": "...",
+            "wake_time": "HH:MM",
+            "bedtime": "HH:MM",
+            "timezone": "IANA/Timezone",
             "health_anchors": [...]
         }
     """
     try:
-        user_id = current_user_id.get()
+        try:
+            user_id = current_user_id.get()
+        except LookupError:
+            return {"error": "missing_user_context"}
         
         profile = await user_repo.get_profile(user_id)
         
         if not profile:
-            # Return defaults if no profile exists yet
-            logger.info(f"No profile found for user {user_id}, returning defaults")
+            logger.warning(f"No profile found for user {user_id}")
             return {
-                "wake_time": "07:00",
-                "bedtime": "22:00",
-                "timezone": _get_user_timezone(),
-                "health_anchors": []
+                "error": "profile_not_found",
+                "user_id": user_id,
+            }
+
+        required_fields = ["wake_time", "bedtime", "timezone"]
+        missing_fields = [field for field in required_fields if not profile.get(field)]
+        if missing_fields:
+            logger.warning(
+                f"Profile for user {user_id} is missing required fields: {missing_fields}"
+            )
+            return {
+                "error": "incomplete_profile",
+                "user_id": user_id,
+                "missing_fields": missing_fields,
             }
         
         return {
-            "wake_time": profile.wake_time,
-            "bedtime": profile.bedtime,
-            "timezone": profile.timezone,
-            "health_anchors": profile.health_anchors or []
+            "wake_time": profile.get("wake_time"),
+            "bedtime": profile.get("bedtime"),
+            "timezone": profile.get("timezone"),
+            "health_anchors": profile.get("health_anchors", []) or []
         }
         
     except Exception as e:

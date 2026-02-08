@@ -8,6 +8,10 @@ from composio import Composio, Action
 from datetime import datetime, timedelta
 import logging
 import pytz
+from zoneinfo import ZoneInfo
+
+from context import current_user_id, current_user_timezone
+from firestore import get_firestore
 
 # Ensure .env is loaded regardless of import order (safe to call multiple times)
 load_dotenv()
@@ -20,7 +24,7 @@ ENTITY_ID = "default"
 # Lazy initialization - client created on first use (after .env is loaded by ADK)
 _composio_client = None
 _entity = None
-_user_timezone = None  # Cached timezone from Google Calendar
+_user_timezone_by_user: dict[str, str] = {}
 
 
 def _get_entity():
@@ -43,39 +47,52 @@ def _get_entity():
 
 def _get_user_timezone() -> str:
     """
-    Get timezone from user's Google Calendar settings.
-    Cached after first fetch to avoid repeated API calls.
-    Falls back to UTC if fetch fails.
+    Resolve timezone from request context/profile.
+    Source priority:
+    1) current_user_timezone ContextVar (set by websocket init/thinking mode)
+    2) users/{user_id}.timezone from Firestore
+    3) UTC fallback
     """
-    global _user_timezone
-    
-    if _user_timezone is not None:
-        return _user_timezone
-    
+
+    tz_from_context = current_user_timezone.get()
+    if tz_from_context:
+        try:
+            ZoneInfo(tz_from_context)
+            try:
+                user_id_from_context = current_user_id.get()
+            except LookupError:
+                user_id_from_context = None
+            if user_id_from_context:
+                _user_timezone_by_user[user_id_from_context] = tz_from_context
+            return tz_from_context
+        except Exception:
+            logger.warning(f"Invalid timezone in context: {tz_from_context}")
+
     try:
-        entity = _get_entity()
-        result = entity.execute(
-            action=Action.GOOGLECALENDAR_GET_CALENDAR,
-            params={"calendar_id": "primary"}
-        )
-        
-        # Extract timezone from calendar settings
-        data = result.get("data", result)
-        
-        # Handle nested structure from Composio (data -> calendar_data -> timeZone)
-        if "calendar_data" in data:
-            timezone = data["calendar_data"].get("timeZone", "UTC")
-        else:
-            timezone = data.get("timeZone", "UTC")
-        
-        _user_timezone = timezone
-        logger.info(f"Fetched user timezone from Google Calendar: {timezone}")
-        return timezone
-        
-    except Exception as e:
-        logger.warning(f"Failed to fetch timezone from Google Calendar: {e}. Using UTC as fallback.")
-        _user_timezone = "UTC"
+        user_id = current_user_id.get()
+    except LookupError:
+        user_id = None
+
+    if not user_id:
         return "UTC"
+
+    cached_timezone = _user_timezone_by_user.get(user_id)
+    if cached_timezone:
+        return cached_timezone
+
+    try:
+        doc = get_firestore().collection("users").document(user_id).get()
+        if doc.exists:
+            timezone = (doc.to_dict() or {}).get("timezone")
+            if timezone:
+                ZoneInfo(timezone)
+                _user_timezone_by_user[user_id] = timezone
+                current_user_timezone.set(timezone)
+                return timezone
+    except Exception as e:
+        logger.warning(f"Failed to resolve timezone for user {user_id}: {e}")
+
+    return "UTC"
 
 
 # ========================================

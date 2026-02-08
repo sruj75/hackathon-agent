@@ -109,6 +109,12 @@ class TestPhase6WebSocketFlow:
             "run_thinking_mode",
             staticmethod(_empty_thinking_mode),
         )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(
+            main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
         monkeypatch.setattr(main.session_manager, "get_or_create_session", get_or_create_mock)
         monkeypatch.setattr(
             main.session_manager, "save_agent_session_to_db", AsyncMock(return_value=True)
@@ -128,6 +134,7 @@ class TestPhase6WebSocketFlow:
                             "type": "init",
                             "resume_session_id": "session_user_test_2026-02-06",
                             "trigger_type": "checkin",
+                            "timezone": "America/New_York",
                         }
                     )
                 },
@@ -140,6 +147,7 @@ class TestPhase6WebSocketFlow:
         expected_session_id = ADKSessionManager.get_daily_session_id("user_test")
         assert ws.accepted is True
         assert fake_session.state["trigger_type"] == "checkin"
+        assert fake_session.state["user_timezone"] == "America/New_York"
         get_or_create_mock.assert_awaited_with(
             app_name=main.APP_NAME, user_id="user_test", session_id=expected_session_id
         )
@@ -163,6 +171,12 @@ class TestPhase6WebSocketFlow:
             staticmethod(_empty_thinking_mode),
         )
         monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(
+            main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(
             main.session_manager, "get_or_create_session", AsyncMock(return_value=fake_session)
         )
         monkeypatch.setattr(
@@ -183,6 +197,7 @@ class TestPhase6WebSocketFlow:
                             "type": "init",
                             "resume_session_id": "session_a",
                             "trigger_type": "morning_wake",
+                            "timezone": "America/Chicago",
                         }
                     )
                 },
@@ -192,6 +207,7 @@ class TestPhase6WebSocketFlow:
                             "type": "init",
                             "resume_session_id": "session_b",
                             "trigger_type": "checkin",
+                            "timezone": "Asia/Kolkata",
                         }
                     )
                 },
@@ -203,6 +219,7 @@ class TestPhase6WebSocketFlow:
 
         # Regression check: a second init should be ignored.
         assert fake_session.state["trigger_type"] == "morning_wake"
+        assert fake_session.state["user_timezone"] == "America/Chicago"
 
     @pytest.mark.asyncio
     async def test_generative_ui_function_response_is_forwarded_to_frontend(
@@ -224,6 +241,12 @@ class TestPhase6WebSocketFlow:
             main.AgentRuntime,
             "run_thinking_mode",
             staticmethod(_empty_thinking_mode),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(
+            main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
         )
         monkeypatch.setattr(
             main.session_manager, "get_or_create_session", AsyncMock(return_value=fake_session)
@@ -259,3 +282,54 @@ class TestPhase6WebSocketFlow:
         )
         assert any(message.get("turnComplete") is True for message in parsed_messages)
         assert save_session_mock.await_count >= 1
+
+
+@pytest.mark.regression
+class TestMorningWakeBootstrap:
+    def test_parse_wake_time_returns_none_for_missing_or_invalid(self):
+        assert main._parse_wake_time(None) is None
+        assert main._parse_wake_time("") is None
+        assert main._parse_wake_time("not-a-time") is None
+        assert main._parse_wake_time("24:00") is None
+        assert main._parse_wake_time("08:70") is None
+        assert main._parse_wake_time("08:30") == (8, 30)
+
+    @pytest.mark.asyncio
+    async def test_missing_wake_time_skips_morning_wake_creation(self, monkeypatch):
+        find_pending_mock = AsyncMock()
+        create_event_mock = AsyncMock()
+        create_cron_mock = AsyncMock()
+
+        monkeypatch.setattr(main.event_repo, "find_pending_morning_event", find_pending_mock)
+        monkeypatch.setattr(main.event_repo, "create_event", create_event_mock)
+        monkeypatch.setattr(main.cron_service, "create_one_time_job", create_cron_mock)
+
+        await main._ensure_morning_wake_for_user(
+            {"user_id": "user_test", "timezone": "America/New_York"}
+        )
+
+        find_pending_mock.assert_not_awaited()
+        create_event_mock.assert_not_awaited()
+        create_cron_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_wake_time_skips_morning_wake_creation(self, monkeypatch):
+        find_pending_mock = AsyncMock()
+        create_event_mock = AsyncMock()
+        create_cron_mock = AsyncMock()
+
+        monkeypatch.setattr(main.event_repo, "find_pending_morning_event", find_pending_mock)
+        monkeypatch.setattr(main.event_repo, "create_event", create_event_mock)
+        monkeypatch.setattr(main.cron_service, "create_one_time_job", create_cron_mock)
+
+        await main._ensure_morning_wake_for_user(
+            {
+                "user_id": "user_test",
+                "timezone": "America/New_York",
+                "wake_time": "invalid",
+            }
+        )
+
+        find_pending_mock.assert_not_awaited()
+        create_event_mock.assert_not_awaited()
+        create_cron_mock.assert_not_awaited()

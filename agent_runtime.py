@@ -11,7 +11,6 @@ from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import types
 
 from context import current_user_id, current_session_id, current_user_timezone
-from repos import user_repo
 from session_manager import ADKSessionManager
 from voice_agent.agent import thinking_agent, conversation_agent
 
@@ -56,7 +55,7 @@ class AgentRuntime:
         # 2. Set Context
         current_user_id.set(user_id)
         current_session_id.set(session_id)
-        resolved_timezone = timezone
+        resolved_timezone = timezone or current_user_timezone.get()
 
         if resolved_timezone:
             try:
@@ -66,16 +65,6 @@ class AgentRuntime:
                     f"[THINKING] Invalid timezone '{resolved_timezone}' for user {user_id}. Falling back."
                 )
                 resolved_timezone = None
-
-        if not resolved_timezone:
-            try:
-                profile = await user_repo.get_profile(user_id)
-                profile_timezone = (profile or {}).get("timezone")
-                if profile_timezone:
-                    ZoneInfo(profile_timezone)
-                    resolved_timezone = profile_timezone
-            except Exception as tz_error:
-                logger.warning(f"[THINKING] Failed to resolve profile timezone for {user_id}: {tz_error}")
 
         current_user_timezone.set(resolved_timezone or "UTC")
         
