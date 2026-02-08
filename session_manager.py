@@ -125,13 +125,18 @@ class ADKSessionManager:
             if not db_session:
                 return None
             
-            # Create session in memory with restored state
-            # Note: db_session.state is a dict
+            # Create session in memory with restored state.
+            # Firestore repo returns a plain dict, not an object with attributes.
+            restored_state = (
+                db_session.get("state", {})
+                if isinstance(db_session, dict)
+                else getattr(db_session, "state", {})
+            )
             session = await self.service.create_session(
                 app_name=app_name,
                 user_id=user_id,
                 session_id=session_id,
-                state=db_session.state
+                state=restored_state
             )
             return session
         except Exception as e:

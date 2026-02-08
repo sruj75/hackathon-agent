@@ -1941,7 +1941,7 @@ def tasks_tool(operation: str, params = None):
 # UNIFIED TASK MANAGEMENT (Agent-Facing Interface)
 # ========================================
 
-def task_management(operation: str, params: dict = None) -> dict:
+def task_management(operation: str, params=None) -> dict:
     """
     Unified task management tool (handles Google Tasks + Calendar linking).
     
