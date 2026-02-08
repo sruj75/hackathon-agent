@@ -28,8 +28,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Import agent after loading env
 from voice_agent.agent import (  # noqa: E402
     conversation_agent as agent,
-    build_conversation_agent,
-    get_conversation_model_candidates,
 )
 from voice_agent.render_ui_tools import set_ui_event_queue, get_ui_event_queue  # noqa: E402
 
@@ -93,30 +91,17 @@ app.add_middleware(
 # Session and Runner setup
 session_manager = ADKSessionManager()
 runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_manager.service)
-_active_conversation_model = agent.model
 
 
-def _is_live_model_mismatch_error(error: Exception) -> bool:
-    """Detect model-name/model-capability mismatches from Live API errors."""
+def _is_live_transient_error(error: Exception) -> bool:
+    """Detect transient Live API availability/overload errors."""
     message = str(error).lower()
     return (
-        "not found for api version" in message
-        or "not supported for bidigeneratecontent" in message
-        or "model not found" in message
+        "service is currently unavailable" in message
+        or " 503 " in message
+        or "unavailable" in message
+        or "overloaded" in message
     )
-
-
-def _ordered_conversation_models() -> list[str]:
-    """
-    Return conversation models with current active model first.
-    Ensures we keep using the last known-good model whenever possible.
-    """
-    candidates = get_conversation_model_candidates()
-    if _active_conversation_model in candidates:
-        return [_active_conversation_model] + [
-            m for m in candidates if m != _active_conversation_model
-        ]
-    return candidates
 
 
 def _is_valid_hhmm(value: str | None) -> bool:
@@ -771,8 +756,7 @@ async def websocket_endpoint(
     session.state.setdefault("user_timezone", profile_timezone)
 
     live_request_queue = LiveRequestQueue()
-    ws_model_candidates = _ordered_conversation_models()
-    logger.info(f"WebSocket model candidates: {ws_model_candidates}")
+    logger.info(f"WebSocket model: {agent.model}")
     
     # Create UI event queue for this connection
     ui_event_queue = asyncio.Queue()
@@ -959,23 +943,14 @@ async def websocket_endpoint(
 
     async def downstream_task() -> None:
         """Receives Events from run_live() and sends to WebSocket."""
-        global runner, _active_conversation_model
         logger.debug("downstream_task started")
+        max_retries = 2
+        model_name = str(agent.model)
+        logger.info(f"[LIVE] Attempting run_live with conversation model: {model_name}")
 
-        for index, model_name in enumerate(ws_model_candidates):
-            # Preserve existing test behavior by using module-level runner first.
-            if index == 0 and model_name == _active_conversation_model:
-                ws_runner = runner
-            else:
-                ws_runner = Runner(
-                    app_name=APP_NAME,
-                    agent=build_conversation_agent(model_name),
-                    session_service=session_manager.service,
-                )
-
-            logger.info(f"[LIVE] Attempting run_live with conversation model: {model_name}")
+        for attempt in range(1, max_retries + 1):
             try:
-                async for event in ws_runner.run_live(
+                async for event in runner.run_live(
                     user_id=user_id,
                     session_id=unified_session_id,
                     live_request_queue=live_request_queue,
@@ -984,22 +959,17 @@ async def websocket_endpoint(
                     should_continue = await _process_downstream_event(event)
                     if not should_continue:
                         return
-
-                # Successful completion: persist active model for future sessions.
-                if model_name != _active_conversation_model:
-                    _active_conversation_model = model_name
-                    runner = ws_runner
-                    logger.info(
-                        f"[LIVE] Switched active conversation model to: {_active_conversation_model}"
-                    )
                 return
             except Exception as e:
-                is_last = index == (len(ws_model_candidates) - 1)
-                if _is_live_model_mismatch_error(e) and not is_last:
+                is_last_attempt = attempt == max_retries
+                if _is_live_transient_error(e) and not is_last_attempt:
+                    backoff_seconds = 2 ** (attempt - 1)
                     logger.warning(
-                        f"[LIVE] Model '{model_name}' unavailable for bidi stream ({e}). "
-                        f"Falling back to next candidate."
+                        f"[LIVE] Transient live error with model '{model_name}' "
+                        f"(attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {backoff_seconds}s."
                     )
+                    await asyncio.sleep(backoff_seconds)
                     continue
                 raise
 

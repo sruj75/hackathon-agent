@@ -4,8 +4,6 @@ Thinking Mode: Background planning
 Conversation Mode: Interactive voice 
 """
 from google.adk.agents import Agent
-import os
-from typing import List
 from .composio_tools import task_management
 from .render_ui_tools import generative_ui
 from .notification_tools import send_push_notification_tool
@@ -17,22 +15,10 @@ logger = logging.getLogger(__name__)
 
 # Models
 # Conversation Mode: Gemini Live model (Live API / Audio)
-# Keep configurable to avoid hard failures when preview model names rotate.
-# Default remains the model that is currently known to work with ADK live bidi
-# in this codebase/deployment setup.
-CONVERSATION_MODEL = os.getenv(
-    "CONVERSATION_MODEL",
-    "gemini-2.5-flash-native-audio-preview-09-2025",
-)
-# Ordered fallback models for live/bidi drift handling.
-# Supports comma-separated env var, e.g.
-# CONVERSATION_MODEL_FALLBACKS="gemini-2.5-flash-native-audio-preview-09-2025,gemini-live-2.5-flash-preview"
-CONVERSATION_MODEL_FALLBACKS = os.getenv(
-    "CONVERSATION_MODEL_FALLBACKS",
-    "gemini-live-2.5-flash-preview,gemini-2.0-flash-live-preview-04-09",
-)
+# Single model by design: no fallback chain.
+CONVERSATION_MODEL = "gemini-live-2.5-flash-native-audio"
 # Thinking Mode: Standard API / Text
-THINKING_MODEL = os.getenv("THINKING_MODEL", "gemini-3-flash-preview")
+THINKING_MODEL = "gemini-3-flash-preview"
 
 AGENT_NAME = "intentive_planner"
 # ---------------------------------------------------------
@@ -382,23 +368,11 @@ CONVERSATION_TOOLS = [
 # ---------------------------------------------------------
 
 
-def get_conversation_model_candidates() -> List[str]:
-    """
-    Ordered conversation model candidates with de-duplication.
-    First item is preferred, remaining are fallbacks.
-    """
-    candidates: List[str] = [CONVERSATION_MODEL]
-    for model_name in [m.strip() for m in CONVERSATION_MODEL_FALLBACKS.split(",") if m.strip()]:
-        if model_name not in candidates:
-            candidates.append(model_name)
-    return candidates
-
-
-def build_conversation_agent(model_name: str | None = None) -> Agent:
-    """Build a conversation-mode agent for a specific live model."""
+def build_conversation_agent() -> Agent:
+    """Build the conversation-mode agent."""
     return Agent(
         name=AGENT_NAME,
-        model=model_name or CONVERSATION_MODEL,
+        model=CONVERSATION_MODEL,
         description="Interactive voice assistant with visual feedback",
         instruction=CONVERSATION_INSTRUCTION,
         tools=CONVERSATION_TOOLS,
@@ -423,4 +397,3 @@ root_agent = conversation_agent
 logger.info(f"Intentive Planner initialized.")
 logger.info(f"  Thinking Mode: {THINKING_MODEL} ({len(THINKING_TOOLS)} tools)")
 logger.info(f"  Conversation Mode: {CONVERSATION_MODEL} ({len(CONVERSATION_TOOLS)} tools)")
-logger.info(f"  Conversation fallbacks: {get_conversation_model_candidates()}")
