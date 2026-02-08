@@ -9,6 +9,22 @@ from datetime import datetime
 from firestore import get_firestore
 
 
+def _where(query, field: str, op: str, value):
+    """
+    Apply a Firestore where filter using modern API when available.
+    Falls back for compatibility with older SDKs and test doubles.
+    """
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter  # type: ignore
+    except Exception:
+        return query.where(field, op, value)
+
+    try:
+        return query.where(filter=FieldFilter(field, op, value))
+    except TypeError:
+        return query.where(field, op, value)
+
+
 async def save_session(session_id: str, state: dict, user_id: Optional[str] = None, date: Optional[str] = None) -> dict:
     """Save or update session state."""
     db = get_firestore()
@@ -58,7 +74,7 @@ async def get_today_session(user_id: str, date: str) -> Optional[dict]:
     
     # Query sessions by user_id and date
     sessions_ref = db.collection("sessions")
-    query = sessions_ref.where("user_id", "==", user_id).where("date", "==", date).limit(1)
+    query = _where(_where(sessions_ref, "user_id", "==", user_id), "date", "==", date).limit(1)
     docs = query.stream()
     
     for doc in docs:

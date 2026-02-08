@@ -1,4 +1,23 @@
 {
-  "indexes": [],
+  "indexes": [
+    {
+      "collectionGroup": "events",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "cron_job_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "executed",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "scheduled_time",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
   "fieldOverrides": []
 }

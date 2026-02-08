@@ -7,7 +7,29 @@ Collections:
 from datetime import datetime, timezone
 from typing import Optional, List
 import uuid
+import logging
 from firestore import get_firestore
+
+logger = logging.getLogger(__name__)
+
+
+def _where(query, field: str, op: str, value):
+    """
+    Apply a Firestore where filter.
+
+    Uses the new keyword-based API when available to avoid deprecation
+    warnings, and falls back to positional arguments for test doubles
+    and older client versions.
+    """
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter  # type: ignore
+    except Exception:
+        return query.where(field, op, value)
+
+    try:
+        return query.where(filter=FieldFilter(field, op, value))
+    except TypeError:
+        return query.where(field, op, value)
 
 
 async def create_event(user_id: str, scheduled_time: datetime, event_type: str, payload: dict, cron_job_id: Optional[int] = None) -> dict:
@@ -70,11 +92,19 @@ async def get_event_by_type_and_time(user_id: str, event_type: str, scheduled_ti
     
     # Query events matching criteria
     events_ref = db.collection("events")
-    query = (events_ref
-             .where("user_id", "==", user_id)
-             .where("event_type", "==", event_type)
-             .where("scheduled_time", "==", scheduled_time)
-             .limit(1))
+    query = (
+        _where(
+            _where(
+                _where(events_ref, "user_id", "==", user_id),
+                "event_type",
+                "==",
+                event_type,
+            ),
+            "scheduled_time",
+            "==",
+            scheduled_time,
+        ).limit(1)
+    )
     
     docs = query.stream()
     for doc in docs:
@@ -101,12 +131,22 @@ async def find_pending_morning_event(user_id: str, seed_date: str) -> Optional[d
     """
     db = get_firestore()
     query = (
-        db.collection("events")
-        .where("user_id", "==", user_id)
-        .where("event_type", "==", "morning_wake")
-        .where("executed", "==", False)
-        .where("payload.seed_date", "==", seed_date)
-        .limit(1)
+        _where(
+            _where(
+                _where(
+                    _where(db.collection("events"), "user_id", "==", user_id),
+                    "event_type",
+                    "==",
+                    "morning_wake",
+                ),
+                "executed",
+                "==",
+                False,
+            ),
+            "payload.seed_date",
+            "==",
+            seed_date,
+        ).limit(1)
     )
     docs = query.stream()
     for doc in docs:
@@ -121,11 +161,41 @@ async def list_future_unexecuted_events_missing_cron(limit: int = 200) -> List[d
     """
     db = get_firestore()
     now_utc = datetime.now(timezone.utc)
-    query = (
-        db.collection("events")
-        .where("executed", "==", False)
-        .where("cron_job_id", "==", None)
-        .where("scheduled_time", ">", now_utc)
-        .limit(limit)
-    )
-    return [doc.to_dict() for doc in query.stream()]
+    try:
+        query = (
+            _where(
+                _where(
+                    _where(db.collection("events"), "executed", "==", False),
+                    "cron_job_id",
+                    "==",
+                    None,
+                ),
+                "scheduled_time",
+                ">",
+                now_utc,
+            ).limit(limit)
+        )
+        return [doc.to_dict() for doc in query.stream()]
+    except Exception as e:
+        if "requires an index" not in str(e):
+            raise
+
+        # Fallback keeps startup healthy if composite index isn't deployed yet.
+        logger.warning(
+            "[event_repo] Missing Firestore index for reconciliation query; using fallback scan. "
+            "Configure firestore.indexes.json and deploy indexes for best performance."
+        )
+        candidate_query = _where(
+            db.collection("events"),
+            "scheduled_time",
+            ">",
+            now_utc,
+        ).limit(max(limit * 10, limit))
+        reconciliable: List[dict] = []
+        for doc in candidate_query.stream():
+            row = doc.to_dict()
+            if row.get("executed") is False and row.get("cron_job_id") is None:
+                reconciliable.append(row)
+                if len(reconciliable) >= limit:
+                    break
+        return reconciliable

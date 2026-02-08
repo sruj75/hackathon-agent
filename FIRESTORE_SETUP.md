@@ -124,6 +124,11 @@ The backend will automatically create these collections:
 
 Once Firestore is set up:
 1. Update `.env` with Firebase credentials
-2. Run `pip install -r requirements.txt` to install `firebase-admin`
-3. Start the backend: `python3 main.py`
-4. Deploy to Render with `FIREBASE_CREDENTIALS` environment variable
+2. Deploy indexes from `firestore.indexes.json` (for cron reconciliation queries):
+   ```bash
+   firebase deploy --only firestore:indexes
+   ```
+   Or create the suggested index directly from backend startup logs.
+3. Run `pip install -r requirements.txt` to install `firebase-admin`
+4. Start the backend: `python3 main.py`
+5. Deploy to Render with `FIREBASE_CREDENTIALS` environment variable
