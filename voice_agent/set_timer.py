@@ -12,6 +12,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _event_id_from_record(event: object) -> str:
+    """Extract event id from either dict-style or object-style records."""
+    if isinstance(event, dict):
+        event_id = event.get("id")
+    else:
+        event_id = getattr(event, "id", None)
+
+    if not event_id:
+        raise ValueError("Event was created but no id was returned")
+    return str(event_id)
+
 async def set_checkin_timer(
     duration_minutes: int,
     reason: str
@@ -54,15 +66,17 @@ async def set_checkin_timer(
             payload={"reason": reason}
         )
         
+        event_id = _event_id_from_record(event)
+
         # Create corresponding dynamic cron job
         cron_job_id = await cron_service.create_one_time_job(
             target_datetime=scheduled_time,
-            event_id=event.id,
+            event_id=event_id,
             timezone=tz_name
         )
-        
+
         # Update event with cron job ID
-        await event_repo.update_cron_job_id(event.id, cron_job_id)
+        await event_repo.update_cron_job_id(event_id, cron_job_id)
         
         logger.info(
             f"[set_checkin_timer] Scheduled check-in for {user_id} at {scheduled_time.strftime('%I:%M %p')} "

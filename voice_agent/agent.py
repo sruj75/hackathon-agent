@@ -4,6 +4,7 @@ Thinking Mode: Background planning
 Conversation Mode: Interactive voice 
 """
 from google.adk.agents import Agent
+import os
 from .composio_tools import task_management
 from .render_ui_tools import generative_ui
 from .notification_tools import send_push_notification_tool
@@ -14,10 +15,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Models
-# Conversation Mode: Gemini 2.5 Flash (Live API / Audio)
-CONVERSATION_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
-# Thinking Mode: Gemini 3 Flash (Standard API / Text)
-THINKING_MODEL = "gemini-3-flash-preview"
+# Conversation Mode: Gemini Live model (Live API / Audio)
+# Keep configurable to avoid hard failures when preview model names rotate.
+CONVERSATION_MODEL = os.getenv("CONVERSATION_MODEL", "gemini-live-2.5-flash-preview")
+# Thinking Mode: Standard API / Text
+THINKING_MODEL = os.getenv("THINKING_MODEL", "gemini-3-flash-preview")
 
 AGENT_NAME = "intentive_planner"
 # ---------------------------------------------------------

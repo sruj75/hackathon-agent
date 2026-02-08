@@ -49,6 +49,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _event_field(event: object, field: str, default=None):
+    """Read an event field from either a dict record or object-style record."""
+    if isinstance(event, dict):
+        return event.get(field, default)
+    return getattr(event, field, default)
+
 # Suppress Pydantic serialization warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
@@ -117,7 +124,7 @@ async def execute_event(
         raise HTTPException(status_code=404, detail="Event not found")
     
     # Idempotency check: if already executed, return success
-    if event.executed:
+    if _event_field(event, "executed", False):
         logger.info(f"Event {event_id} already executed, skipping")
         return {"status": "already_executed"}
     
@@ -132,10 +139,14 @@ async def execute_event(
     trigger_prompt = "You just woke up."
     
     # 2. Run Turn via AgentRuntime
-    logger.info(f"--- Calling AgentRuntime.run_thinking_mode for user {event.user_id} ---")
+    event_user_id = _event_field(event, "user_id")
+    if not event_user_id:
+        raise HTTPException(status_code=500, detail="Event missing user_id")
+
+    logger.info(f"--- Calling AgentRuntime.run_thinking_mode for user {event_user_id} ---")
     try:
         async for agent_event in AgentRuntime.run_thinking_mode(
-            user_id=event.user_id,
+            user_id=event_user_id,
             trigger_context=trigger_prompt,
             session_manager=session_manager
         ):
@@ -155,11 +166,12 @@ async def execute_event(
     await event_repo.mark_executed(event_id)
     
     # Cleanup: Delete the cron job from cron-jobs.org
-    if event.cron_job_id:
+    event_cron_job_id = _event_field(event, "cron_job_id")
+    if event_cron_job_id:
         try:
-            await cron_service.delete_job(event.cron_job_id)
+            await cron_service.delete_job(event_cron_job_id)
         except Exception as cleanup_error:
-            logger.warning(f"Failed to cleanup cron job {event.cron_job_id}: {cleanup_error}")
+            logger.warning(f"Failed to cleanup cron job {event_cron_job_id}: {cleanup_error}")
             # Don't fail the request if cleanup fails
     
     return {"status": "executed", "agent_response": "processed"}
@@ -249,12 +261,16 @@ async def websocket_endpoint(
     set_ui_event_queue(ui_event_queue)
     logger.info("UI event queue created for this connection")
 
-    # Send simple activation message to initiate conversation and let agent greet naturally
-    activation_message = types.Content(
-        parts=[types.Part(text="Hello")]
-    )
-    live_request_queue.send_content(activation_message)
-    logger.info("Sent activation message to start conversation")
+    # Optional auto-activation text turn. Disabled by default because mixing
+    # send_content and realtime audio at connection start can cause live API
+    # argument errors depending on model/backend behavior.
+    if os.getenv("WS_SEND_ACTIVATION_MESSAGE", "false").lower() in ("1", "true", "yes"):
+        activation_message = types.Content(
+            role="user",
+            parts=[types.Part(text="Hello")]
+        )
+        live_request_queue.send_content(activation_message)
+        logger.info("Sent activation message to start conversation")
 
     # ========================================
     # Bidirectional Streaming Tasks
@@ -275,8 +291,8 @@ async def websocket_endpoint(
                     break
 
                 # Handle binary frames (audio data)
-                if "bytes" in message:
-                    audio_data = message["bytes"]
+                audio_data = message.get("bytes")
+                if audio_data is not None:
                     logger.debug(f"Received audio chunk: {len(audio_data)} bytes")
                     audio_blob = types.Blob(
                         mime_type="audio/pcm;rate=16000", data=audio_data
@@ -284,7 +300,7 @@ async def websocket_endpoint(
                     live_request_queue.send_realtime(audio_blob)
 
                 # Handle text frames (JSON messages)
-                elif "text" in message:
+                elif message.get("text") is not None:
                     text_data = message["text"]
                     logger.debug(f"Received text message: {text_data[:100]}...")
                     

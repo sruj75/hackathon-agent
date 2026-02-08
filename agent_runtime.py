@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import datetime
 import json
 from typing import AsyncGenerator, Optional
@@ -13,6 +14,15 @@ from session_manager import ADKSessionManager
 from voice_agent.agent import thinking_agent, conversation_agent
 
 logger = logging.getLogger(__name__)
+
+
+def _is_retryable_model_error(error: Exception) -> bool:
+    """Return True for transient model/API overload errors worth retrying."""
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int) and status_code in (429, 503):
+        return True
+    message = str(error).upper()
+    return "UNAVAILABLE" in message or "OVERLOADED" in message
 
 class AgentRuntime:
     """
@@ -68,16 +78,29 @@ class AgentRuntime:
         trigger_content = types.Content(parts=[types.Part(text=trigger_context)])
         
         try:
-            async for event in runner.run_async(
-                user_id=user_id,
-                session_id=session_id,
-                new_message=trigger_content,
-                run_config=run_config
-            ):
-                yield event
-        except Exception as e:
-            logger.error(f"❌ [THINKING] Failed: {e}")
-            raise e
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    async for event in runner.run_async(
+                        user_id=user_id,
+                        session_id=session_id,
+                        new_message=trigger_content,
+                        run_config=run_config
+                    ):
+                        yield event
+                    break
+                except Exception as e:
+                    if _is_retryable_model_error(e) and attempt < max_attempts:
+                        backoff_seconds = 2 ** (attempt - 1)
+                        logger.warning(
+                            f"⚠️ [THINKING] Attempt {attempt}/{max_attempts} failed with transient model error: {e}. "
+                            f"Retrying in {backoff_seconds}s."
+                        )
+                        await asyncio.sleep(backoff_seconds)
+                        continue
+
+                    logger.error(f"❌ [THINKING] Failed: {e}")
+                    raise e
         finally:
             # 6. Fetch LATEST session state from Service
             latest_session = await session_manager.get_or_create_session(
