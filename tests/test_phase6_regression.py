@@ -91,6 +91,25 @@ async def _empty_thinking_mode(*_args, **_kwargs):
 
 @pytest.mark.regression
 class TestPhase6WebSocketFlow:
+    def test_select_ws_session_id_uses_requested_when_valid(self):
+        selected = main._select_ws_session_id(
+            "user_test", "session_user_test_2026-02-06"
+        )
+        assert selected == "session_user_test_2026-02-06"
+
+    def test_select_ws_session_id_rejects_invalid_or_wrong_user(self):
+        fallback = ADKSessionManager.get_daily_session_id("user_test")
+        assert (
+            main._select_ws_session_id("user_test", "client_random_session")
+            == fallback
+        )
+        assert (
+            main._select_ws_session_id(
+                "user_test", "session_other_user_2026-02-06"
+            )
+            == fallback
+        )
+
     @pytest.mark.asyncio
     async def test_init_handshake_stores_trigger_type(self, monkeypatch):
         fake_session = SimpleNamespace(state={})
@@ -151,6 +170,52 @@ class TestPhase6WebSocketFlow:
         assert fake_session.state["user_timezone"] == "America/New_York"
         get_or_create_mock.assert_awaited_with(
             app_name=main.APP_NAME, user_id="user_test", session_id=expected_session_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_websocket_uses_valid_requested_session_id(self, monkeypatch):
+        fake_session = SimpleNamespace(state={})
+        get_or_create_mock = AsyncMock(return_value=fake_session)
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _FakeLiveRequestQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_conversation_mode_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "run_thinking_mode",
+            staticmethod(_empty_thinking_mode),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(
+            main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(main.session_manager, "get_or_create_session", get_or_create_mock)
+        monkeypatch.setattr(
+            main.session_manager, "save_agent_session_to_db", AsyncMock(return_value=True)
+        )
+
+        async def fake_run_live(**_kwargs):
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.runner, "run_live", fake_run_live)
+
+        ws = _FakeWebSocket([{"type": "websocket.disconnect"}])
+
+        await main.websocket_endpoint(ws, "user_test", "session_user_test_2026-02-06")
+
+        get_or_create_mock.assert_awaited_with(
+            app_name=main.APP_NAME,
+            user_id="user_test",
+            session_id="session_user_test_2026-02-06",
         )
 
     @pytest.mark.asyncio

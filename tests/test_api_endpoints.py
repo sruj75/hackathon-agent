@@ -123,6 +123,59 @@ async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_execute_event_failure_schedules_retry(api_client, monkeypatch):
+    event = {
+        "id": "event_retry",
+        "user_id": "user_test",
+        "event_type": "checkin",
+        "payload": {"reason": "deep_work", "timezone": "UTC", "retry_count": 0},
+        "executed": False,
+        "cron_job_id": 11111,
+    }
+    monkeypatch.setenv("EXECUTE_EVENT_RETRY_DELAY_MINUTES", "1")
+    monkeypatch.setenv("EXECUTE_EVENT_MAX_RETRIES", "2")
+
+    get_event_mock = AsyncMock(return_value=event)
+    mark_executed_mock = AsyncMock(return_value=None)
+    update_event_mock = AsyncMock(return_value=True)
+    create_retry_cron_mock = AsyncMock(return_value=22222)
+    delete_job_mock = AsyncMock(return_value=True)
+
+    async def failing_thinking_mode(**kwargs):
+        _ = kwargs
+        raise Exception("temporary model failure")
+        if False:  # pragma: no cover
+            yield MagicMock()
+
+    monkeypatch.setattr(main.event_repo, "get_by_id", get_event_mock)
+    monkeypatch.setattr(main.event_repo, "mark_executed", mark_executed_mock)
+    monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
+    monkeypatch.setattr(
+        main.cron_service, "create_one_time_job", create_retry_cron_mock
+    )
+    monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
+    monkeypatch.setattr(main.AgentRuntime, "run_thinking_mode", failing_thinking_mode)
+
+    response = await api_client.post("/api/execute-event/event_retry")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "retry_scheduled"
+    assert body["retry_count"] == 1
+
+    mark_executed_mock.assert_not_awaited()
+    delete_job_mock.assert_not_awaited()
+    create_retry_cron_mock.assert_awaited_once()
+
+    assert update_event_mock.await_count == 1
+    update_args = update_event_mock.await_args
+    assert update_args.args[0] == "event_retry"
+    assert update_args.kwargs["executed"] is False
+    assert update_args.kwargs["cron_job_id"] == 22222
+    assert update_args.kwargs["payload"]["retry_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_get_preferences_not_found(api_client, monkeypatch):
     monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
 
@@ -182,3 +235,36 @@ async def test_put_preferences_updates_profile_and_resyncs_scheduler(api_client,
     assert body["scheduler"]["resynced"] is True
     update_profile_mock.assert_awaited_once()
     resync_mock.assert_awaited_once_with(updated_profile)
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_does_not_overwrite_anchors_when_omitted(
+    api_client, monkeypatch
+):
+    updated_profile = {
+        "user_id": "user_test",
+        "wake_time": "06:30",
+        "bedtime": "22:00",
+        "timezone": "UTC",
+        "health_anchors": ["sleep", "exercise"],
+    }
+    update_profile_mock = AsyncMock(return_value=updated_profile)
+    resync_mock = AsyncMock(return_value=None)
+
+    monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
+    monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
+
+    response = await api_client.put(
+        "/api/preferences/user_test",
+        json={
+            "wake_time": "06:30",
+            "bedtime": "22:00",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    update_profile_mock.assert_awaited_once()
+    update_args = update_profile_mock.await_args
+    assert update_args.args[0] == "user_test"
+    assert "health_anchors" not in update_args.kwargs

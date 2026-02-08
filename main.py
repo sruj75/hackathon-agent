@@ -55,6 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 HHMM_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+SESSION_ID_PATTERN = re.compile(r"^session_(?P<user_id>.+)_(?P<date>\d{4}-\d{2}-\d{2})$")
 
 
 def _event_field(event: object, field: str, default=None):
@@ -179,6 +180,7 @@ def _validate_preferences_payload(payload: dict) -> tuple[dict, list[str]]:
     wake_time = payload.get("wake_time")
     bedtime = payload.get("bedtime")
     timezone_name = payload.get("timezone")
+    has_health_anchors = "health_anchors" in payload
     health_anchors = _normalize_health_anchors(payload.get("health_anchors"))
 
     if not _is_valid_hhmm(wake_time):
@@ -194,12 +196,14 @@ def _validate_preferences_payload(payload: dict) -> tuple[dict, list[str]]:
         except Exception:
             errors.append("timezone must be a valid IANA timezone")
 
-    sanitized = {
+    sanitized: dict[str, object] = {
         "wake_time": wake_time,
         "bedtime": bedtime,
         "timezone": timezone_name,
-        "health_anchors": health_anchors,
     }
+    # Preserve existing anchors unless explicitly provided by caller.
+    if has_health_anchors:
+        sanitized["health_anchors"] = health_anchors
     return sanitized, errors
 
 
@@ -208,6 +212,27 @@ def _profile_is_complete(profile: dict | None) -> bool:
         return False
     valid_scheduler_profile, _ = _validate_profile_for_scheduler(profile)
     return valid_scheduler_profile
+
+
+def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str:
+    """
+    Select conversation session ID.
+
+    Uses explicit session IDs only when they follow our deterministic pattern and
+    belong to the same user; otherwise falls back to today's unified session.
+    """
+    fallback_session_id = ADKSessionManager.get_daily_session_id(user_id)
+    if not requested_session_id:
+        return fallback_session_id
+
+    match = SESSION_ID_PATTERN.match(requested_session_id)
+    if not match:
+        return fallback_session_id
+
+    if match.group("user_id") != user_id:
+        return fallback_session_id
+
+    return requested_session_id
 
 
 def _normalize_timezone(timezone_name: str | None, fallback: str = "UTC") -> str:
@@ -552,7 +577,76 @@ async def execute_event(
         
     except Exception as e:
         logger.error(f"❌ [THINKING] Agent failed to run: {e}")
-        # Don't re-raise, we still want to mark event as executed so we don't loop forever
+        retry_delay_minutes = int(os.getenv("EXECUTE_EVENT_RETRY_DELAY_MINUTES", "2"))
+        max_retries = int(os.getenv("EXECUTE_EVENT_MAX_RETRIES", "2"))
+        now_utc = datetime.now(timezone.utc)
+        retry_count = 0
+        try:
+            retry_count = int(payload.get("retry_count", 0))
+        except Exception:
+            retry_count = 0
+
+        if retry_count >= max_retries:
+            await event_repo.update_event(
+                event_id,
+                executed=True,
+                last_error=str(e),
+                last_attempt_at=now_utc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "failed_permanently",
+                    "event_id": event_id,
+                    "retry_count": retry_count,
+                    "error": str(e),
+                },
+            )
+
+        retry_at = now_utc + timedelta(minutes=retry_delay_minutes)
+        next_retry_count = retry_count + 1
+        retry_payload = {
+            **payload,
+            "retry_count": next_retry_count,
+        }
+
+        try:
+            retry_cron_job_id = await cron_service.create_one_time_job(
+                target_datetime=retry_at,
+                event_id=event_id,
+                timezone=event_timezone,
+            )
+            await event_repo.update_event(
+                event_id,
+                scheduled_time=retry_at,
+                payload=retry_payload,
+                executed=False,
+                cron_job_id=retry_cron_job_id,
+                last_error=str(e),
+                last_attempt_at=now_utc,
+            )
+            return {
+                "status": "retry_scheduled",
+                "event_id": event_id,
+                "retry_count": next_retry_count,
+                "retry_at": retry_at.isoformat(),
+            }
+        except Exception as retry_error:
+            await event_repo.update_event(
+                event_id,
+                executed=False,
+                last_error=f"agent_error={e}; retry_error={retry_error}",
+                last_attempt_at=now_utc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "agent_failed",
+                    "event_id": event_id,
+                    "retry_scheduled": False,
+                    "error": str(e),
+                },
+            )
     
     # Mark event as executed
     await event_repo.mark_executed(event_id)
@@ -647,7 +741,7 @@ async def websocket_endpoint(
     # Override session_id with the deterministic daily ID
     # This aligns the WebSocket connection with the same session used by cron/background agent.
     # We ignore the client-provided session_id (which is often random or stale).
-    unified_session_id = ADKSessionManager.get_daily_session_id(user_id)
+    unified_session_id = _select_ws_session_id(user_id, session_id)
     logger.info(f"Map WebSocket connection to Unified Session ID: {unified_session_id}")
 
     # Set context variables for this request/connection
@@ -764,11 +858,11 @@ async def websocket_endpoint(
                                     f"[WS-INIT] Failed to persist timezone for {user_id}: {profile_update_error}"
                                 )
                             
-                            # If explicit resume requested, update context variable
                             if resume_session_id and resume_session_id != unified_session_id:
-                                logger.info(f"[WS-INIT] Client requested explicit session: {resume_session_id} (current: {unified_session_id})")
-                                # Note: We keep using unified_session_id for consistency
-                                # The session was already loaded/created with the correct ID
+                                logger.info(
+                                    f"[WS-INIT] Received resume_session_id={resume_session_id}, "
+                                    f"using session_id={unified_session_id}"
+                                )
                             
                             continue  # Don't process init message further
                         
