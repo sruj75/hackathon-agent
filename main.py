@@ -763,17 +763,6 @@ async def websocket_endpoint(
     set_ui_event_queue(ui_event_queue)
     logger.info("UI event queue created for this connection")
 
-    # Optional auto-activation text turn. Disabled by default because mixing
-    # send_content and realtime audio at connection start can cause live API
-    # argument errors depending on model/backend behavior.
-    if os.getenv("WS_SEND_ACTIVATION_MESSAGE", "false").lower() in ("1", "true", "yes"):
-        activation_message = types.Content(
-            role="user",
-            parts=[types.Part(text="Hello")]
-        )
-        live_request_queue.send_content(activation_message)
-        logger.info("Sent activation message to start conversation")
-
     # ========================================
     # Bidirectional Streaming Tasks
     # ========================================
@@ -847,6 +836,20 @@ async def websocket_endpoint(
                                     f"[WS-INIT] Received resume_session_id={resume_session_id}, "
                                     f"using session_id={unified_session_id}"
                                 )
+
+                            # Agent-first greeting turn, always sent after init.
+                            activation_message = types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(
+                                        text=(
+                                            "Start with a brief greeting, then ask how you can help."
+                                        )
+                                    )
+                                ],
+                            )
+                            live_request_queue.send_content(activation_message)
+                            logger.info("[WS-INIT] Sent activation message")
                             
                             continue  # Don't process init message further
                         
