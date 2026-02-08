@@ -56,6 +56,9 @@ async def create_one_time_job(
                 "timezone": timezone,
                 "hours": [target_datetime.hour],
                 "minutes": [target_datetime.minute],
+                # cron-jobs.org schedule behaves more consistently when wdays
+                # is explicitly provided (all weekdays).
+                "wdays": [-1],
                 "mdays": [target_datetime.day],
                 "months": [target_datetime.month],
                 "expiresAt": expires_at_formatted
@@ -102,8 +105,16 @@ async def create_one_time_job(
                 or "unknown"
             )
 
-            # Retry on server-side cron-jobs.org failures.
-            if status >= 500 and attempt < max_attempts:
+            # Retry on server-side and rate-limit failures.
+            if status in (429,) or status >= 500:
+                if attempt >= max_attempts:
+                    logger.error(
+                        f"❌ Cron-jobs.org API error after retries: status={status}, request_id={request_id}, body={response_text}"
+                    )
+                    raise Exception(
+                        f"Failed to create cron job (status={status}, request_id={request_id}): {response_text}"
+                    )
+
                 backoff_seconds = 2 ** (attempt - 1)
                 logger.warning(
                     f"⚠️ Cron-jobs.org transient error (attempt {attempt}/{max_attempts}) "
