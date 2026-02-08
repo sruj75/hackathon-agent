@@ -63,7 +63,7 @@ async def set_checkin_timer(
             user_id,
             scheduled_time,
             "checkin",
-            payload={"reason": reason}
+            payload={"reason": reason, "timezone": tz_name}
         )
         
         event_id = _event_id_from_record(event)

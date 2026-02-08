@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -24,7 +25,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Import agent after loading env
-from voice_agent.agent import conversation_agent as agent  # noqa: E402
+from voice_agent.agent import (  # noqa: E402
+    conversation_agent as agent,
+    build_conversation_agent,
+    get_conversation_model_candidates,
+)
 from voice_agent.render_ui_tools import set_ui_event_queue, get_ui_event_queue  # noqa: E402
 
 from google.adk.runners import Runner
@@ -37,8 +42,7 @@ from context import current_session_id, current_user_id
 # New imports for Cron Endpoints
 from fastapi import Header, HTTPException, Depends
 from repos import event_repo, user_repo
-from datetime import datetime, timedelta, time
-import os
+from datetime import datetime, timedelta, time, timezone
 from agent_runtime import AgentRuntime
 import cron_service
 
@@ -85,6 +89,167 @@ app.add_middleware(
 # Session and Runner setup
 session_manager = ADKSessionManager()
 runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_manager.service)
+_active_conversation_model = agent.model
+
+
+def _is_live_model_mismatch_error(error: Exception) -> bool:
+    """Detect model-name/model-capability mismatches from Live API errors."""
+    message = str(error).lower()
+    return (
+        "not found for api version" in message
+        or "not supported for bidigeneratecontent" in message
+        or "model not found" in message
+    )
+
+
+def _ordered_conversation_models() -> list[str]:
+    """
+    Return conversation models with current active model first.
+    Ensures we keep using the last known-good model whenever possible.
+    """
+    candidates = get_conversation_model_candidates()
+    if _active_conversation_model in candidates:
+        return [_active_conversation_model] + [
+            m for m in candidates if m != _active_conversation_model
+        ]
+    return candidates
+
+
+def _parse_wake_time(wake_time_raw: str | None) -> tuple[int, int]:
+    """Parse HH:MM wake-time strings with safe fallback."""
+    if not wake_time_raw:
+        return (8, 0)
+    try:
+        hour_str, minute_str = wake_time_raw.strip().split(":", 1)
+        hour = max(0, min(23, int(hour_str)))
+        minute = max(0, min(59, int(minute_str)))
+        return (hour, minute)
+    except Exception:
+        return (8, 0)
+
+
+def _next_morning_wake_datetime(user_timezone: str, wake_time_raw: str | None) -> datetime:
+    """
+    Compute next local morning wake datetime for a user.
+    If today's wake time already passed, schedule for tomorrow.
+    """
+    tz = ZoneInfo(user_timezone or "UTC")
+    now_local = datetime.now(tz)
+    wake_hour, wake_minute = _parse_wake_time(wake_time_raw)
+    target_local = now_local.replace(
+        hour=wake_hour, minute=wake_minute, second=0, microsecond=0
+    )
+    if target_local <= now_local:
+        target_local = target_local + timedelta(days=1)
+    return target_local
+
+
+def _as_datetime(value) -> datetime | None:
+    """Best-effort conversion for Firestore datetime fields."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    return None
+
+
+async def _ensure_morning_wake_for_user(user: dict) -> None:
+    """
+    Ensure exactly one pending morning wake event exists for user's next wake date.
+    Creates event + cron if missing; backfills cron if event exists without cron id.
+    """
+    user_id = user.get("user_id")
+    if not user_id:
+        return
+
+    user_timezone = user.get("timezone", "UTC")
+    wake_time_raw = user.get("wake_time")
+    target_local = _next_morning_wake_datetime(user_timezone, wake_time_raw)
+    seed_date = target_local.date().isoformat()
+
+    existing = await event_repo.find_pending_morning_event(user_id, seed_date)
+    if existing:
+        if not _event_field(existing, "cron_job_id"):
+            event_id = _event_field(existing, "id")
+            if not event_id:
+                logger.warning(
+                    f"[morning-bootstrap] Existing event missing id for user {user_id}, seed_date={seed_date}"
+                )
+                return
+            scheduled_time = _as_datetime(_event_field(existing, "scheduled_time")) or target_local
+            cron_job_id = await cron_service.create_one_time_job(
+                target_datetime=scheduled_time,
+                event_id=event_id,
+                timezone=user_timezone,
+            )
+            await event_repo.update_cron_job_id(event_id, cron_job_id)
+            logger.info(
+                f"[morning-bootstrap] Backfilled cron for existing morning event user={user_id}, "
+                f"event_id={event_id}, cron_job_id={cron_job_id}"
+            )
+        return
+
+    created = await event_repo.create_event(
+        user_id=user_id,
+        scheduled_time=target_local,
+        event_type="morning_wake",
+        payload={
+            "reason": "daily_bootstrap",
+            "seed_date": seed_date,
+            "timezone": user_timezone,
+        },
+    )
+    event_id = _event_field(created, "id")
+    if not event_id:
+        raise ValueError(f"[morning-bootstrap] Failed to create event id for user {user_id}")
+
+    cron_job_id = await cron_service.create_one_time_job(
+        target_datetime=target_local,
+        event_id=event_id,
+        timezone=user_timezone,
+    )
+    await event_repo.update_cron_job_id(event_id, cron_job_id)
+    logger.info(
+        f"[morning-bootstrap] Created morning wake event user={user_id}, "
+        f"event_id={event_id}, wake={target_local.isoformat()}, cron_job_id={cron_job_id}"
+    )
+
+
+async def _reconcile_missing_cron_jobs() -> None:
+    """
+    Backfill cron jobs for future events that were created but failed to schedule.
+    """
+    missing_events = await event_repo.list_future_unexecuted_events_missing_cron(limit=200)
+    if not missing_events:
+        return
+
+    logger.info(f"[cron-reconcile] Found {len(missing_events)} events missing cron_job_id")
+    for event in missing_events:
+        try:
+            event_id = _event_field(event, "id")
+            if not event_id:
+                continue
+            scheduled_time = _as_datetime(_event_field(event, "scheduled_time"))
+            if not scheduled_time:
+                continue
+
+            payload = _event_field(event, "payload", {}) or {}
+            timezone_name = payload.get("timezone")
+            if not timezone_name:
+                profile = await user_repo.get_profile(_event_field(event, "user_id", ""))
+                timezone_name = (profile or {}).get("timezone", "UTC")
+
+            cron_job_id = await cron_service.create_one_time_job(
+                target_datetime=scheduled_time,
+                event_id=event_id,
+                timezone=timezone_name or "UTC",
+            )
+            await event_repo.update_cron_job_id(event_id, cron_job_id)
+            logger.info(
+                f"[cron-reconcile] Backfilled cron job for event {event_id}: {cron_job_id}"
+            )
+        except Exception as e:
+            logger.warning(f"[cron-reconcile] Failed for event {_event_field(event, 'id')}: {e}")
 
 
 # ========================================
@@ -135,8 +300,16 @@ async def execute_event(
 # Agent Logic: Thinking Mode (Text)
 # ========================================
     
-    # 1. Trigger Prompt (Minimal - agent uses tools to understand context)
-    trigger_prompt = "You just woke up."
+    # 1. Trigger Prompt (minimal but event-aware)
+    event_type = _event_field(event, "event_type", "checkin")
+    payload = _event_field(event, "payload", {}) or {}
+    reason = payload.get("reason")
+    if event_type == "morning_wake":
+        trigger_prompt = "You just woke up."
+    else:
+        trigger_prompt = (
+            f"A scheduled check-in timer fired. reason={reason or 'unspecified'}"
+        )
     
     # 2. Run Turn via AgentRuntime
     event_user_id = _event_field(event, "user_id")
@@ -200,16 +373,38 @@ async def save_push_token(
     return {"status": "saved", "user_id": user_id}
 
 
-# @app.on_event("startup")
-# async def schedule_morning_wakes():
-#     """
-#     Heartbeat Logic:
-#     On server startup, ensure every user has a morning_wake event scheduled for tomorrow.
-#     This guarantees the 'Agent Loop' restarts even if the server crashed overnight.
-#     Idempotent: Checks for existence before creating.
-#     """
-#     # Commented out during Firestore migration
-#     pass
+@app.on_event("startup")
+async def reliability_bootstrap() -> None:
+    """
+    Reliability bootstrap:
+    1) Ensure each user has a pending next-morning wake event + cron
+    2) Reconcile future events that are missing cron_job_id
+    """
+    if os.getenv("ENABLE_RELIABILITY_BOOTSTRAP", "true").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        logger.info("[bootstrap] Reliability bootstrap disabled by env")
+        return
+
+    try:
+        users = await user_repo.get_all_users()
+        logger.info(f"[bootstrap] Seeding morning wake events for {len(users)} users")
+        for user in users:
+            try:
+                await _ensure_morning_wake_for_user(user)
+            except Exception as user_error:
+                logger.warning(
+                    f"[bootstrap] Failed to seed morning wake for user {(user or {}).get('user_id')}: {user_error}"
+                )
+    except Exception as e:
+        logger.warning(f"[bootstrap] Failed to seed morning wakes: {e}")
+
+    try:
+        await _reconcile_missing_cron_jobs()
+    except Exception as e:
+        logger.warning(f"[bootstrap] Failed cron reconciliation: {e}")
 
 
 @app.websocket("/ws/{user_id}/{session_id}")
@@ -255,6 +450,8 @@ async def websocket_endpoint(
     )
 
     live_request_queue = LiveRequestQueue()
+    ws_model_candidates = _ordered_conversation_models()
+    logger.info(f"WebSocket model candidates: {ws_model_candidates}")
     
     # Create UI event queue for this connection
     ui_event_queue = asyncio.Queue()
@@ -338,79 +535,132 @@ async def websocket_endpoint(
         except Exception as e:
             logger.debug(f"upstream_task ended: {e}")
 
+    async def _process_downstream_event(event) -> bool:
+        """Process one ADK event and forward to frontend. Returns False on closed socket."""
+        # Explicitly check and log transcriptions
+        if hasattr(event, "server_content") and event.server_content:
+            if (
+                hasattr(event.server_content, "input_transcription")
+                and event.server_content.input_transcription
+            ):
+                logger.info(
+                    f"[TRANSCRIPTION-INPUT] User: {event.server_content.input_transcription.text}"
+                )
+
+            if (
+                hasattr(event.server_content, "output_transcription")
+                and event.server_content.output_transcription
+            ):
+                logger.info(
+                    f"[TRANSCRIPTION-OUTPUT] Agent: {event.server_content.output_transcription.text}"
+                )
+
+        # Log every event with content
+        if event.content and event.content.parts:
+            for i, part in enumerate(event.content.parts):
+                part_attrs = [
+                    a
+                    for a in ["text", "function_call", "function_response", "inline_data"]
+                    if getattr(part, a, None) is not None
+                ]
+                if part_attrs:
+                    logger.info(f"[MAIN-EVENT] Part {i} has: {part_attrs}")
+
+                func_resp = getattr(part, "function_response", None)
+                if func_resp is not None:
+                    func_name = getattr(func_resp, "name", "unknown")
+                    response_data = getattr(func_resp, "response", None)
+
+                    logger.info(f"[MAIN-UI] Found function_response: {func_name}")
+
+                    if func_name == "generative_ui" and isinstance(response_data, dict):
+                        ui_payload = response_data.get("ui_payload")
+                        if ui_payload:
+                            logger.info(
+                                f"[MAIN-UI] >>> Detected ui_payload: component={ui_payload.get('type', 'unknown')}"
+                            )
+                            ui_event = {
+                                "type": "generative_ui",
+                                "component": ui_payload.get("type"),
+                                "props": ui_payload.get("props", {}),
+                            }
+                            try:
+                                await websocket.send_text(json.dumps(ui_event))
+                                logger.info(
+                                    f"[MAIN-UI] <<< SENT generative_ui WebSocket event: {ui_payload.get('type')}"
+                                )
+                            except (RuntimeError, WebSocketDisconnect):
+                                logger.warning(
+                                    "[MAIN-UI] WebSocket closed while sending UI event"
+                                )
+
+        event_json = event.model_dump_json(exclude_none=True, by_alias=True)
+        if hasattr(event, "server_content") and event.server_content:
+            logger.debug(
+                "[TRANSCRIPTION-JSON-SAMPLE] Sending event with serverContent fields"
+            )
+
+        logger.debug("Sending event to client")
+        try:
+            await websocket.send_text(event_json)
+        except (RuntimeError, WebSocketDisconnect):
+            logger.info("WebSocket connection closed, stopping downstream_task")
+            return False
+
+        try:
+            await session_manager.save_agent_session_to_db(
+                unified_session_id, session.state, user_id=user_id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist session state: {e}")
+
+        return True
+
     async def downstream_task() -> None:
         """Receives Events from run_live() and sends to WebSocket."""
+        global runner, _active_conversation_model
         logger.debug("downstream_task started")
-        async for event in runner.run_live(
-            user_id=user_id,
-            session_id=unified_session_id,
-            live_request_queue=live_request_queue,
-            run_config=run_config,
-        ):
-            # ✅ NEW: Explicitly check and log transcriptions
-            if hasattr(event, 'server_content') and event.server_content:
-                if hasattr(event.server_content, 'input_transcription') and event.server_content.input_transcription:
-                    logger.info(f"[TRANSCRIPTION-INPUT] User: {event.server_content.input_transcription.text}")
-                
-                if hasattr(event.server_content, 'output_transcription') and event.server_content.output_transcription:
-                    logger.info(f"[TRANSCRIPTION-OUTPUT] Agent: {event.server_content.output_transcription.text}")
-            
-            # Log every event with content
-            if event.content and event.content.parts:
-                for i, part in enumerate(event.content.parts):
-                    # Log what attributes this part has
-                    part_attrs = [a for a in ['text', 'function_call', 'function_response', 'inline_data'] if getattr(part, a, None) is not None]
-                    if part_attrs:
-                        logger.info(f"[MAIN-EVENT] Part {i} has: {part_attrs}")
-                    
-                    # Check for function_response in the part
-                    func_resp = getattr(part, 'function_response', None)
-                    if func_resp is not None:
-                        func_name = getattr(func_resp, 'name', 'unknown')
-                        response_data = getattr(func_resp, 'response', None)
-                        
-                        logger.info(f"[MAIN-UI] Found function_response: {func_name}")
-                        
-                        if func_name == 'generative_ui' and isinstance(response_data, dict):
-                            ui_payload = response_data.get("ui_payload")
-                            if ui_payload:
-                                logger.info(f"[MAIN-UI] >>> Detected ui_payload: component={ui_payload.get('type', 'unknown')}")
-                                
-                                # Emit custom generative_ui event to frontend
-                                ui_event = {
-                                    "type": "generative_ui",
-                                    "component": ui_payload.get("type"),
-                                    "props": ui_payload.get("props", {})
-                                }
-                                try:
-                                    await websocket.send_text(json.dumps(ui_event))
-                                    logger.info(f"[MAIN-UI] <<< SENT generative_ui WebSocket event: {ui_payload.get('type')}")
-                                except (RuntimeError, WebSocketDisconnect):
-                                    logger.warning("[MAIN-UI] WebSocket closed while sending UI event")
-            
-            # Send original event to client as well
-            event_json = event.model_dump_json(exclude_none=True, by_alias=True)
-            
-            # ✅ NEW: Log a sample to verify field names in JSON
-            if hasattr(event, 'server_content') and event.server_content:
-                logger.debug(f"[TRANSCRIPTION-JSON-SAMPLE] Sending event with serverContent fields")
-            
-            logger.debug(f"Sending event to client")
+
+        for index, model_name in enumerate(ws_model_candidates):
+            # Preserve existing test behavior by using module-level runner first.
+            if index == 0 and model_name == _active_conversation_model:
+                ws_runner = runner
+            else:
+                ws_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=build_conversation_agent(model_name),
+                    session_service=session_manager.service,
+                )
+
+            logger.info(f"[LIVE] Attempting run_live with conversation model: {model_name}")
             try:
-                await websocket.send_text(event_json)
-            except (RuntimeError, WebSocketDisconnect):
-                logger.info("WebSocket connection closed, stopping downstream_task")
-                break
-            
-            # Persist state after significant events
-            # For robustness in v0, try saving periodically or after each event batch
-            # Note: session object is the one we got from get_or_create_session
-            try:
-                # We save on every event for now to ensure we capture state changes.
-                # In production, debouncing or checking event type is better.
-                await session_manager.save_agent_session_to_db(unified_session_id, session.state, user_id=user_id)
+                async for event in ws_runner.run_live(
+                    user_id=user_id,
+                    session_id=unified_session_id,
+                    live_request_queue=live_request_queue,
+                    run_config=run_config,
+                ):
+                    should_continue = await _process_downstream_event(event)
+                    if not should_continue:
+                        return
+
+                # Successful completion: persist active model for future sessions.
+                if model_name != _active_conversation_model:
+                    _active_conversation_model = model_name
+                    runner = ws_runner
+                    logger.info(
+                        f"[LIVE] Switched active conversation model to: {_active_conversation_model}"
+                    )
+                return
             except Exception as e:
-                logger.warning(f"Failed to persist session state: {e}")
+                is_last = index == (len(ws_model_candidates) - 1)
+                if _is_live_model_mismatch_error(e) and not is_last:
+                    logger.warning(
+                        f"[LIVE] Model '{model_name}' unavailable for bidi stream ({e}). "
+                        f"Falling back to next candidate."
+                    )
+                    continue
+                raise
 
     async def ui_event_task() -> None:
         """Reads UI events from queue and sends to WebSocket."""

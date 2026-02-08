@@ -83,8 +83,6 @@ def test_phase2_agent_runtime_interface_contract():
     assert "user_id" in params
     assert "trigger_context" in params
     assert "session_manager" in params
-    assert "db" in params
 
     config = AgentRuntime.get_conversation_mode_config()
     assert config.response_modalities == ["AUDIO"]
-

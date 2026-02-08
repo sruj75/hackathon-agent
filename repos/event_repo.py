@@ -4,7 +4,7 @@ Event repository implementation with Firestore.
 Collections:
 - events/{event_id} - Scheduled events (timers, morning wake)
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 import uuid
 from firestore import get_firestore
@@ -77,3 +77,41 @@ async def get_by_id(event_id: str) -> Optional[dict]:
     if doc.exists:
         return doc.to_dict()
     return None
+
+
+async def find_pending_morning_event(user_id: str, seed_date: str) -> Optional[dict]:
+    """
+    Find an unexecuted morning_wake event for a user's local date key.
+
+    seed_date is a YYYY-MM-DD string in the user's timezone.
+    """
+    db = get_firestore()
+    query = (
+        db.collection("events")
+        .where("user_id", "==", user_id)
+        .where("event_type", "==", "morning_wake")
+        .where("executed", "==", False)
+        .where("payload.seed_date", "==", seed_date)
+        .limit(1)
+    )
+    docs = query.stream()
+    for doc in docs:
+        return doc.to_dict()
+    return None
+
+
+async def list_future_unexecuted_events_missing_cron(limit: int = 200) -> List[dict]:
+    """
+    Return future unexecuted events that do not yet have cron_job_id assigned.
+    Used to reconcile missed cron scheduling after transient failures.
+    """
+    db = get_firestore()
+    now_utc = datetime.now(timezone.utc)
+    query = (
+        db.collection("events")
+        .where("executed", "==", False)
+        .where("cron_job_id", "==", None)
+        .where("scheduled_time", ">", now_utc)
+        .limit(limit)
+    )
+    return [doc.to_dict() for doc in query.stream()]
