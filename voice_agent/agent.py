@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Models
 # Conversation Mode: Gemini Live model (Live API / Audio)
 # Single model by design: no fallback chain.
-CONVERSATION_MODEL = "gemini-live-2.5-flash-native-audio"
+CONVERSATION_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
 # Thinking Mode: Standard API / Text
 THINKING_MODEL = "gemini-3-flash-preview"
 
