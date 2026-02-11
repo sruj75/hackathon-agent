@@ -5,6 +5,7 @@ Ensures WebSocket session resumption/init handshake and generative UI
 forwarding still work while keeping older behavior intact.
 """
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,12 +13,19 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 import main
+from auth import AuthUser, get_authenticated_user
 from session_manager import ADKSessionManager
+from voice_agent import set_timer as set_timer_module
+
+
+async def _fake_auth_user():
+    return AuthUser(user_id="user_test", email="test@example.com", claims={})
 
 
 class _FakeContent:
-    def __init__(self, parts=None):
+    def __init__(self, parts=None, role=None):
         self.parts = parts or []
+        self.role = role
 
 
 class _FakePart:
@@ -145,6 +153,15 @@ class TestPhase6WebSocketFlow:
                 yield None
 
         monkeypatch.setattr(main.runner, "run_live", fake_run_live)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
 
         ws = _FakeWebSocket(
             [
@@ -152,6 +169,7 @@ class TestPhase6WebSocketFlow:
                     "text": json.dumps(
                         {
                             "type": "init",
+                            "access_token": "jwt_test",
                             "resume_session_id": "session_user_test_2026-02-06",
                             "trigger_type": "checkin",
                             "timezone": "America/New_York",
@@ -162,9 +180,9 @@ class TestPhase6WebSocketFlow:
             ]
         )
 
-        await main.websocket_endpoint(ws, "user_test", "client_random_session")
+        await main.websocket_endpoint(ws, "client_random_session")
 
-        expected_session_id = ADKSessionManager.get_daily_session_id("user_test")
+        expected_session_id = "session_user_test_2026-02-06"
         assert ws.accepted is True
         assert fake_session.state["trigger_type"] == "checkin"
         assert fake_session.state["user_timezone"] == "America/New_York"
@@ -207,10 +225,28 @@ class TestPhase6WebSocketFlow:
                 yield None
 
         monkeypatch.setattr(main.runner, "run_live", fake_run_live)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
 
-        ws = _FakeWebSocket([{"type": "websocket.disconnect"}])
+        ws = _FakeWebSocket(
+            [
+                {
+                    "text": json.dumps(
+                        {"type": "init", "access_token": "jwt_test"}
+                    )
+                },
+                {"type": "websocket.disconnect"},
+            ]
+        )
 
-        await main.websocket_endpoint(ws, "user_test", "session_user_test_2026-02-06")
+        await main.websocket_endpoint(ws, "session_user_test_2026-02-06")
 
         get_or_create_mock.assert_awaited_with(
             app_name=main.APP_NAME,
@@ -254,6 +290,15 @@ class TestPhase6WebSocketFlow:
                 yield None
 
         monkeypatch.setattr(main.runner, "run_live", fake_run_live)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
 
         ws = _FakeWebSocket(
             [
@@ -261,6 +306,7 @@ class TestPhase6WebSocketFlow:
                     "text": json.dumps(
                         {
                             "type": "init",
+                            "access_token": "jwt_test",
                             "resume_session_id": "session_a",
                             "trigger_type": "morning_wake",
                             "timezone": "America/Chicago",
@@ -271,6 +317,7 @@ class TestPhase6WebSocketFlow:
                     "text": json.dumps(
                         {
                             "type": "init",
+                            "access_token": "jwt_test_2",
                             "resume_session_id": "session_b",
                             "trigger_type": "checkin",
                             "timezone": "Asia/Kolkata",
@@ -281,7 +328,7 @@ class TestPhase6WebSocketFlow:
             ]
         )
 
-        await main.websocket_endpoint(ws, "user_test", "client_random_session")
+        await main.websocket_endpoint(ws, "client_random_session")
 
         # Regression check: a second init should be ignored.
         assert fake_session.state["trigger_type"] == "morning_wake"
@@ -334,10 +381,24 @@ class TestPhase6WebSocketFlow:
             yield event
 
         monkeypatch.setattr(main.runner, "run_live", fake_run_live)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
 
-        ws = _FakeWebSocket([{"type": "websocket.disconnect"}])
+        ws = _FakeWebSocket(
+            [
+                {"text": json.dumps({"type": "init", "access_token": "jwt_test"})},
+                {"type": "websocket.disconnect"},
+            ]
+        )
 
-        await main.websocket_endpoint(ws, "user_test", "client_random_session")
+        await main.websocket_endpoint(ws, "client_random_session")
 
         parsed_messages = [json.loads(message) for message in ws.sent_texts]
         assert any(
@@ -406,12 +467,14 @@ class TestPreferencesEndpoints:
     @pytest.mark.asyncio
     async def test_get_preferences_not_found(self, monkeypatch):
         monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
+        main.app.dependency_overrides[get_authenticated_user] = _fake_auth_user
 
         async with AsyncClient(
             transport=ASGITransport(app=main.app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/preferences/user_test")
+            response = await client.get("/api/preferences/me")
+        main.app.dependency_overrides.clear()
 
         assert response.status_code == 200
         body = response.json()
@@ -421,12 +484,13 @@ class TestPreferencesEndpoints:
 
     @pytest.mark.asyncio
     async def test_put_preferences_rejects_invalid_payload(self):
+        main.app.dependency_overrides[get_authenticated_user] = _fake_auth_user
         async with AsyncClient(
             transport=ASGITransport(app=main.app),
             base_url="http://test",
         ) as client:
             response = await client.put(
-                "/api/preferences/user_test",
+                "/api/preferences/me",
                 json={
                     "wake_time": "8am",
                     "bedtime": "99:00",
@@ -434,6 +498,7 @@ class TestPreferencesEndpoints:
                     "health_anchors": [],
                 },
             )
+        main.app.dependency_overrides.clear()
 
         assert response.status_code == 400
         detail = response.json()["detail"]
@@ -454,13 +519,14 @@ class TestPreferencesEndpoints:
 
         monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
         monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
+        main.app.dependency_overrides[get_authenticated_user] = _fake_auth_user
 
         async with AsyncClient(
             transport=ASGITransport(app=main.app),
             base_url="http://test",
         ) as client:
             response = await client.put(
-                "/api/preferences/user_test",
+                "/api/preferences/me",
                 json={
                     "wake_time": "07:30",
                     "bedtime": "22:15",
@@ -468,6 +534,7 @@ class TestPreferencesEndpoints:
                     "health_anchors": ["sleep", "lunch"],
                 },
             )
+        main.app.dependency_overrides.clear()
 
         assert response.status_code == 200
         body = response.json()
@@ -476,3 +543,131 @@ class TestPreferencesEndpoints:
         assert body["preferences"]["wake_time"] == "07:30"
         update_profile_mock.assert_awaited_once()
         resync_mock.assert_awaited_once_with(updated_profile)
+
+
+@pytest.mark.regression
+class TestAutonomySchedulingBoundaries:
+    @pytest.mark.asyncio
+    async def test_morning_event_payload_has_system_ownership(self, monkeypatch):
+        target_local = datetime(2026, 2, 8, 9, 5, tzinfo=timezone.utc)
+        create_event_mock = AsyncMock(return_value={"id": "event_morning_1"})
+        create_cron_mock = AsyncMock(return_value=123)
+        update_cron_job_id_mock = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(main, "_next_morning_wake_datetime", lambda *_args: target_local)
+        monkeypatch.setattr(main.event_repo, "find_pending_morning_event", AsyncMock(return_value=None))
+        monkeypatch.setattr(main.event_repo, "create_event", create_event_mock)
+        monkeypatch.setattr(main.cron_service, "create_one_time_job", create_cron_mock)
+        monkeypatch.setattr(main.event_repo, "update_cron_job_id", update_cron_job_id_mock)
+
+        await main._ensure_morning_wake_for_user(
+            {"user_id": "user_test", "timezone": "UTC", "wake_time": "09:05"}
+        )
+
+        payload = create_event_mock.await_args.kwargs["payload"]
+        assert payload["schedule_owner"] == "system"
+        assert payload["schedule_policy"] == "morning_bootstrap"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_only_backfills_system_morning_events(self, monkeypatch):
+        scheduled_time = datetime(2026, 2, 9, 9, 0, tzinfo=timezone.utc)
+        list_missing_mock = AsyncMock(
+            return_value=[
+                {
+                    "id": "event_checkin_agent",
+                    "event_type": "checkin",
+                    "scheduled_time": scheduled_time,
+                    "payload": {
+                        "reason": "deep_work",
+                        "timezone": "UTC",
+                        "schedule_owner": "agent",
+                        "schedule_policy": "autonomous_checkin",
+                    },
+                },
+                {
+                    "id": "event_morning_system",
+                    "event_type": "morning_wake",
+                    "scheduled_time": scheduled_time,
+                    "payload": {
+                        "reason": "daily_bootstrap",
+                        "timezone": "UTC",
+                    },
+                },
+            ]
+        )
+        create_cron_mock = AsyncMock(return_value=999)
+        update_cron_job_id_mock = AsyncMock(return_value=True)
+        update_event_mock = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            main.event_repo,
+            "list_future_unexecuted_events_missing_cron",
+            list_missing_mock,
+        )
+        monkeypatch.setattr(main.cron_service, "create_one_time_job", create_cron_mock)
+        monkeypatch.setattr(main.event_repo, "update_cron_job_id", update_cron_job_id_mock)
+        monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
+        monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"}))
+
+        await main._reconcile_missing_cron_jobs()
+
+        assert create_cron_mock.await_count == 1
+        assert create_cron_mock.await_args.kwargs["event_id"] == "event_morning_system"
+        payload = update_event_mock.await_args.kwargs["payload"]
+        assert payload["schedule_owner"] == "system"
+        assert payload["schedule_policy"] == "morning_bootstrap"
+
+    @pytest.mark.asyncio
+    async def test_startup_skips_reconcile_by_default(self, monkeypatch):
+        users = [{"user_id": "u1", "timezone": "UTC", "wake_time": "08:00"}]
+        get_all_users_mock = AsyncMock(return_value=users)
+        ensure_wake_mock = AsyncMock(return_value=None)
+        reconcile_mock = AsyncMock(return_value=None)
+
+        monkeypatch.delenv("ENABLE_RELIABILITY_BOOTSTRAP", raising=False)
+        monkeypatch.delenv("ENABLE_MORNING_CRON_RECONCILE", raising=False)
+        monkeypatch.setattr(main.user_repo, "get_all_users", get_all_users_mock)
+        monkeypatch.setattr(main, "_ensure_morning_wake_for_user", ensure_wake_mock)
+        monkeypatch.setattr(main, "_reconcile_missing_cron_jobs", reconcile_mock)
+
+        await main.reliability_bootstrap()
+
+        ensure_wake_mock.assert_awaited_once()
+        reconcile_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_startup_can_enable_morning_reconcile(self, monkeypatch):
+        get_all_users_mock = AsyncMock(return_value=[])
+        reconcile_mock = AsyncMock(return_value=None)
+
+        monkeypatch.delenv("ENABLE_RELIABILITY_BOOTSTRAP", raising=False)
+        monkeypatch.setenv("ENABLE_MORNING_CRON_RECONCILE", "true")
+        monkeypatch.setattr(main.user_repo, "get_all_users", get_all_users_mock)
+        monkeypatch.setattr(main, "_reconcile_missing_cron_jobs", reconcile_mock)
+
+        await main.reliability_bootstrap()
+
+        reconcile_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_agent_timer_payload_has_agent_ownership(self, monkeypatch):
+        set_user_token = set_timer_module.current_user_id.set("user_test")
+        set_session_token = set_timer_module.current_session_id.set("session_test")
+        create_event_mock = AsyncMock(return_value={"id": "event_checkin_1"})
+        create_cron_mock = AsyncMock(return_value=321)
+        update_cron_job_id_mock = AsyncMock(return_value=True)
+        try:
+            monkeypatch.setattr(set_timer_module, "_get_user_timezone", lambda: "UTC")
+            monkeypatch.setattr(set_timer_module.event_repo, "create_event", create_event_mock)
+            monkeypatch.setattr(set_timer_module.cron_service, "create_one_time_job", create_cron_mock)
+            monkeypatch.setattr(set_timer_module.event_repo, "update_cron_job_id", update_cron_job_id_mock)
+
+            response = await set_timer_module.set_checkin_timer(30, "deep_work_end")
+            assert "Timer set for" in response
+
+            payload = create_event_mock.await_args.kwargs["payload"]
+            assert payload["schedule_owner"] == "agent"
+            assert payload["schedule_policy"] == "autonomous_checkin"
+        finally:
+            set_timer_module.current_user_id.reset(set_user_token)
+            set_timer_module.current_session_id.reset(set_session_token)

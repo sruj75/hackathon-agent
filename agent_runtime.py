@@ -56,17 +56,18 @@ class AgentRuntime:
         current_user_id.set(user_id)
         current_session_id.set(session_id)
         resolved_timezone = timezone or current_user_timezone.get()
-
         if resolved_timezone:
             try:
                 ZoneInfo(resolved_timezone)
             except Exception:
                 logger.warning(
-                    f"[THINKING] Invalid timezone '{resolved_timezone}' for user {user_id}. Falling back."
+                    "[THINKING] Invalid timezone '%s' for user %s. Ignoring timezone.",
+                    resolved_timezone,
+                    user_id,
                 )
                 resolved_timezone = None
 
-        current_user_timezone.set(resolved_timezone or "UTC")
+        current_user_timezone.set(resolved_timezone)
         
         # 3. Initialize Session (Load RAM + DB)
         await session_manager.get_or_create_session(
@@ -124,13 +125,13 @@ class AgentRuntime:
             )
             
             # Sync ADK events to state for persistence
-            # We explicitly save the event history into the state dict so it persists in Firestore
+            # We explicitly save the event history into state so it persists in storage
             if hasattr(latest_session, 'events'):
                  latest_session.state['history'] = [
                      event.model_dump(mode='json') for event in latest_session.events
                  ]
             
-            # 7. Save to Firestore
+            # 7. Save to persistent storage
             await session_manager.save_agent_session_to_db(session_id, latest_session.state, user_id=user_id)
 
     @staticmethod

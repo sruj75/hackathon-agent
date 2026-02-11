@@ -1,6 +1,4 @@
-"""
-Integration tests for complete end-to-end flows using Firestore-era interfaces.
-"""
+"""Integration tests for complete end-to-end flows using repository interfaces."""
 
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch

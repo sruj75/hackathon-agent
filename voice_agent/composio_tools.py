@@ -11,38 +11,38 @@ import pytz
 from zoneinfo import ZoneInfo
 
 from context import current_user_id, current_user_timezone
-from firestore import get_firestore
 
 # Ensure .env is loaded regardless of import order (safe to call multiple times)
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Use default entity (your connected account)
-ENTITY_ID = "default"
-
 # Lazy initialization - client created on first use (after .env is loaded by ADK)
 _composio_client = None
-_entity = None
 _user_timezone_by_user: dict[str, str] = {}
 
 
 def _get_entity():
-    """Get or create the Composio entity. Lazy init ensures .env is loaded first."""
-    global _composio_client, _entity
-    
-    if _entity is None:
+    """Get Composio entity bound to the current authenticated user."""
+    global _composio_client
+
+    if _composio_client is None:
         api_key = os.environ.get("COMPOSIO_API_KEY")
         if not api_key:
             logger.error("COMPOSIO_API_KEY not found in environment!")
             raise ValueError("COMPOSIO_API_KEY environment variable is not set")
-        
-        logger.info(f"Initializing Composio client with API key: {api_key[:10]}...")
+
+        logger.info("Initializing Composio client with API key prefix: %s", api_key[:10])
         _composio_client = Composio(api_key=api_key)
-        _entity = _composio_client.get_entity(ENTITY_ID)
-        logger.info("Composio entity initialized successfully")
-    
-    return _entity
+        logger.info("Composio client initialized successfully")
+
+    try:
+        user_id = current_user_id.get()
+    except LookupError as exc:
+        raise ValueError("missing_user_context_for_composio") from exc
+    if not user_id:
+        raise ValueError("missing_user_context_for_composio")
+    return _composio_client.get_entity(user_id)
 
 
 def _get_user_timezone() -> str:
@@ -50,8 +50,8 @@ def _get_user_timezone() -> str:
     Resolve timezone from request context/profile.
     Source priority:
     1) current_user_timezone ContextVar (set by websocket init/thinking mode)
-    2) users/{user_id}.timezone from Firestore
-    3) UTC fallback
+    2) per-user cached timezone from previous resolved context
+    3) no fallback (timezone required)
     """
 
     tz_from_context = current_user_timezone.get()
@@ -74,25 +74,13 @@ def _get_user_timezone() -> str:
         user_id = None
 
     if not user_id:
-        return "UTC"
+        raise ValueError("missing_timezone")
 
     cached_timezone = _user_timezone_by_user.get(user_id)
     if cached_timezone:
         return cached_timezone
 
-    try:
-        doc = get_firestore().collection("users").document(user_id).get()
-        if doc.exists:
-            timezone = (doc.to_dict() or {}).get("timezone")
-            if timezone:
-                ZoneInfo(timezone)
-                _user_timezone_by_user[user_id] = timezone
-                current_user_timezone.set(timezone)
-                return timezone
-    except Exception as e:
-        logger.warning(f"Failed to resolve timezone for user {user_id}: {e}")
-
-    return "UTC"
+    raise ValueError("missing_timezone")
 
 
 # ========================================
@@ -1984,29 +1972,64 @@ def task_management(operation: str, params=None) -> dict:
     """
     if params is None:
         params = {}
-    
+
     logger.info(f"[TASK_MGMT] >>> operation={operation}, params={params}")
-    
-    if operation == "add_task":
-        result = add_task(**params)
-    elif operation == "timeblock_task":
-        result = timeblock_task(**params)
-    elif operation == "complete_task":
-        result = complete_task(**params)
-    elif operation == "delete_task":
-        result = delete_task(**params)
-    elif operation == "get_tasks":
-        result = get_tasks_filtered(**params)
-    elif operation == "get_schedule":
-        result = get_schedule(**params)
-    elif operation == "check_conflicts":
-        result = check_conflicts(**params)
-    else:
-        result = {
-            "success": False,
-            "error": "invalid_operation",
-            "message": f"Unknown operation: {operation}. Valid: add_task, timeblock_task, complete_task, delete_task, get_tasks, get_schedule, check_conflicts"
-        }
-    
+    try:
+        if operation == "add_task":
+            result = add_task(**params)
+        elif operation == "timeblock_task":
+            result = timeblock_task(**params)
+        elif operation == "complete_task":
+            result = complete_task(**params)
+        elif operation == "delete_task":
+            result = delete_task(**params)
+        elif operation == "get_tasks":
+            result = get_tasks_filtered(**params)
+        elif operation == "get_schedule":
+            result = get_schedule(**params)
+        elif operation == "check_conflicts":
+            result = check_conflicts(**params)
+        else:
+            result = {
+                "success": False,
+                "error": "invalid_operation",
+                "message": "Unknown operation: "
+                f"{operation}. Valid: add_task, timeblock_task, complete_task, "
+                "delete_task, get_tasks, get_schedule, check_conflicts",
+            }
+    except ValueError as exc:
+        reason = str(exc)
+        if reason == "missing_timezone":
+            result = {
+                "success": False,
+                "error": "missing_timezone",
+                "message": (
+                    "Timezone is required before calendar/time operations can run. "
+                    "Please send a valid IANA timezone from the client."
+                ),
+            }
+        elif reason == "missing_user_context_for_composio":
+            result = {
+                "success": False,
+                "error": "missing_user_context",
+                "message": "User context is missing. Reconnect and try again.",
+            }
+        else:
+            result = {"success": False, "error": reason, "message": reason}
+    except Exception as exc:
+        error_text = str(exc)
+        lowered = error_text.lower()
+        if "connected account" in lowered or "authentication" in lowered:
+            result = {
+                "success": False,
+                "error": "composio_not_connected",
+                "message": (
+                    "Google integration is not connected for this user. "
+                    "Please reconnect from app settings."
+                ),
+            }
+        else:
+            result = {"success": False, "error": "composio_error", "message": error_text}
+
     logger.info(f"[TASK_MGMT] <<< success={result.get('success')}, has_data={'data' in result}")
     return result

@@ -1,4 +1,4 @@
-"""Unit tests for ADKSessionManager with current Firestore-era repository contracts."""
+"""Unit tests for ADKSessionManager with current repository contracts."""
 
 from unittest.mock import AsyncMock, MagicMock
 

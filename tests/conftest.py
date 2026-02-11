@@ -1,8 +1,4 @@
-"""
-Shared pytest fixtures for testing.
-
-NOTE: Tests temporarily disabled during Firestore migration.
-"""
+"""Shared pytest fixtures for testing."""
 import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch

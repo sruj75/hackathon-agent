@@ -1,4 +1,4 @@
-"""API endpoint tests for current Firestore-era backend."""
+"""API endpoint tests for current backend."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6,15 +6,21 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 import main
+from auth import AuthUser, get_authenticated_user
 
 
 @pytest.fixture
 async def api_client():
+    async def _fake_user():
+        return AuthUser(user_id="user_test", email="test@example.com", claims={})
+
+    main.app.dependency_overrides[get_authenticated_user] = _fake_user
     async with AsyncClient(
         transport=ASGITransport(app=main.app),
         base_url="http://test",
     ) as client:
         yield client
+    main.app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
@@ -42,7 +48,6 @@ async def test_save_token_success(api_client, monkeypatch):
     response = await api_client.post(
         "/api/save-token",
         json={
-            "user_id": "user_test",
             "token": "ExponentPushToken[abc123]",
         },
     )
@@ -54,13 +59,13 @@ async def test_save_token_success(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_save_token_rejects_invalid_payload(api_client):
-    missing_field = await api_client.post("/api/save-token", json={"user_id": "u1"})
+    missing_field = await api_client.post("/api/save-token", json={})
     assert missing_field.status_code == 400
-    assert missing_field.json()["detail"] == "Missing user_id or token"
+    assert missing_field.json()["detail"] == "Missing token"
 
     invalid_format = await api_client.post(
         "/api/save-token",
-        json={"user_id": "u1", "token": "not-an-expo-token"},
+        json={"token": "not-an-expo-token"},
     )
     assert invalid_format.status_code == 400
     assert invalid_format.json()["detail"] == "Invalid token format"
@@ -179,7 +184,7 @@ async def test_execute_event_failure_schedules_retry(api_client, monkeypatch):
 async def test_get_preferences_not_found(api_client, monkeypatch):
     monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
 
-    response = await api_client.get("/api/preferences/user_unknown")
+    response = await api_client.get("/api/preferences/me")
 
     assert response.status_code == 200
     body = response.json()
@@ -190,7 +195,7 @@ async def test_get_preferences_not_found(api_client, monkeypatch):
 @pytest.mark.asyncio
 async def test_put_preferences_validates_input(api_client):
     response = await api_client.put(
-        "/api/preferences/user_test",
+        "/api/preferences/me",
         json={
             "wake_time": "bad",
             "bedtime": "bad",
@@ -220,7 +225,7 @@ async def test_put_preferences_updates_profile_and_resyncs_scheduler(api_client,
     monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
 
     response = await api_client.put(
-        "/api/preferences/user_test",
+        "/api/preferences/me",
         json={
             "wake_time": "07:30",
             "bedtime": "22:15",
@@ -255,7 +260,7 @@ async def test_put_preferences_does_not_overwrite_anchors_when_omitted(
     monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
 
     response = await api_client.put(
-        "/api/preferences/user_test",
+        "/api/preferences/me",
         json={
             "wake_time": "06:30",
             "bedtime": "22:00",

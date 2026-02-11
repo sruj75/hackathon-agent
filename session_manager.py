@@ -72,7 +72,7 @@ class ADKSessionManager:
         user_id: Optional[str] = None
     ) -> bool:
         """
-        Syncs in-memory state to Firestore via repo.
+        Syncs in-memory state to persistent storage via repo.
         
         Args:
             session_id: Session identifier
@@ -110,7 +110,7 @@ class ADKSessionManager:
         user_id: str
     ) -> Optional[Session]:
         """
-        Loads session from Firestore and injects into RAM.
+        Loads session from persistent storage and injects into RAM.
         
         Args:
             app_name: ADK App Name
@@ -126,7 +126,7 @@ class ADKSessionManager:
                 return None
             
             # Create session in memory with restored state.
-            # Firestore repo returns a plain dict, not an object with attributes.
+            # Repo returns a plain dict, not an object with attributes.
             restored_state = (
                 db_session.get("state", {})
                 if isinstance(db_session, dict)

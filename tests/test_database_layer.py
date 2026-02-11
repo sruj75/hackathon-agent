@@ -1,4 +1,4 @@
-"""Repository tests for Firestore-backed repos using an in-memory fake Firestore."""
+"""Repository tests for Supabase/Postgres-backed repos with in-memory fakes."""
 
 from __future__ import annotations
 
@@ -10,103 +10,18 @@ import pytest
 from repos import event_repo, session_repo, user_repo
 
 
-class FakeDocSnapshot:
-    def __init__(self, data: dict | None):
-        self._data = deepcopy(data) if data is not None else None
+class FakeAcquire:
+    def __init__(self, conn: "FakeConnection"):
+        self.conn = conn
 
-    @property
-    def exists(self) -> bool:
-        return self._data is not None
+    async def __aenter__(self):
+        return self.conn
 
-    def to_dict(self) -> dict:
-        return deepcopy(self._data)
-
-
-class FakeDocRef:
-    def __init__(self, collection_store: dict[str, dict], doc_id: str):
-        self._collection_store = collection_store
-        self._doc_id = doc_id
-
-    def get(self) -> FakeDocSnapshot:
-        return FakeDocSnapshot(self._collection_store.get(self._doc_id))
-
-    def set(self, data: dict, merge: bool = False):
-        if merge and self._doc_id in self._collection_store:
-            merged = deepcopy(self._collection_store[self._doc_id])
-            merged.update(deepcopy(data))
-            self._collection_store[self._doc_id] = merged
-            return
-        self._collection_store[self._doc_id] = deepcopy(data)
-
-    def update(self, data: dict):
-        if self._doc_id not in self._collection_store:
-            raise KeyError(f"Document does not exist: {self._doc_id}")
-        self._collection_store[self._doc_id].update(deepcopy(data))
-
-    def delete(self):
-        self._collection_store.pop(self._doc_id, None)
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
-class FakeQuery:
-    def __init__(self, collection_store: dict[str, dict]):
-        self._collection_store = collection_store
-        self._filters: list[tuple[str, str, object]] = []
-        self._limit: int | None = None
-
-    def where(self, field: str, op: str, value: object):
-        self._filters.append((field, op, value))
-        return self
-
-    def limit(self, count: int):
-        self._limit = count
-        return self
-
-    def stream(self):
-        docs = []
-        for doc in self._collection_store.values():
-            if self._matches(doc):
-                docs.append(FakeDocSnapshot(doc))
-        if self._limit is not None:
-            docs = docs[: self._limit]
-        return docs
-
-    def _nested_get(self, doc: dict, field: str):
-        value = doc
-        for part in field.split("."):
-            if not isinstance(value, dict) or part not in value:
-                return None
-            value = value[part]
-        return value
-
-    def _matches(self, doc: dict) -> bool:
-        for field, op, expected in self._filters:
-            actual = self._nested_get(doc, field)
-            if op == "==" and actual != expected:
-                return False
-            if op == ">":
-                if actual is None or actual <= expected:
-                    return False
-        return True
-
-
-class FakeCollection:
-    def __init__(self, store: dict[str, dict]):
-        self._store = store
-
-    def document(self, doc_id: str) -> FakeDocRef:
-        return FakeDocRef(self._store, doc_id)
-
-    def where(self, field: str, op: str, value: object) -> FakeQuery:
-        return FakeQuery(self._store).where(field, op, value)
-
-    def limit(self, count: int) -> FakeQuery:
-        return FakeQuery(self._store).limit(count)
-
-    def stream(self):
-        return [FakeDocSnapshot(doc) for doc in self._store.values()]
-
-
-class FakeFirestore:
+class FakePool:
     def __init__(self):
         self._db: dict[str, dict[str, dict]] = {
             "users": {},
@@ -115,24 +30,243 @@ class FakeFirestore:
             "events": {},
         }
 
-    def collection(self, name: str) -> FakeCollection:
-        if name not in self._db:
-            self._db[name] = {}
-        return FakeCollection(self._db[name])
+    def acquire(self):
+        return FakeAcquire(FakeConnection(self._db))
+
+
+class FakeConnection:
+    def __init__(self, db: dict[str, dict[str, dict]]):
+        self._db = db
+
+    async def fetchrow(self, query: str, *args):
+        q = " ".join(query.split())
+
+        if q.startswith("INSERT INTO users "):
+            user_id, wake_time, bedtime, tz, anchors, created_at, updated_at = args
+            row = self._db["users"].get(user_id, {})
+            merged = {
+                **row,
+                "user_id": user_id,
+                "wake_time": wake_time,
+                "bedtime": bedtime,
+                "timezone": tz,
+                "health_anchors": deepcopy(anchors),
+                "created_at": row.get("created_at", created_at),
+                "updated_at": updated_at,
+            }
+            self._db["users"][user_id] = merged
+            return deepcopy(merged)
+
+        if q == "SELECT * FROM users WHERE user_id = $1":
+            row = self._db["users"].get(args[0])
+            return deepcopy(row) if row else None
+
+        if q.startswith("INSERT INTO push_tokens "):
+            user_id, token, created_at, updated_at = args
+            row = self._db["push_tokens"].get(user_id, {})
+            merged = {
+                **row,
+                "user_id": user_id,
+                "expo_push_token": token,
+                "created_at": row.get("created_at", created_at),
+                "updated_at": updated_at,
+            }
+            self._db["push_tokens"][user_id] = merged
+            return deepcopy(merged)
+
+        if q == "SELECT expo_push_token FROM push_tokens WHERE user_id = $1":
+            row = self._db["push_tokens"].get(args[0])
+            return {"expo_push_token": row["expo_push_token"]} if row else None
+
+        if q.startswith("INSERT INTO sessions "):
+            (
+                session_id,
+                user_id,
+                date,
+                state,
+                created_at,
+                updated_at,
+            ) = args
+            row = self._db["sessions"].get(session_id, {})
+            merged = {
+                **row,
+                "session_id": session_id,
+                "user_id": user_id,
+                "date": date,
+                "state": deepcopy(state),
+                "created_at": row.get("created_at", created_at),
+                "updated_at": updated_at,
+            }
+            self._db["sessions"][session_id] = merged
+            return deepcopy(merged)
+
+        if q == "SELECT * FROM sessions WHERE session_id = $1":
+            row = self._db["sessions"].get(args[0])
+            return deepcopy(row) if row else None
+
+        if "FROM sessions WHERE user_id = $1 AND date = $2" in q:
+            user_id, date = args
+            matches = [
+                deepcopy(row)
+                for row in self._db["sessions"].values()
+                if row.get("user_id") == user_id and row.get("date") == date
+            ]
+            matches.sort(key=lambda x: x.get("updated_at"), reverse=True)
+            return matches[0] if matches else None
+
+        if q.startswith("INSERT INTO events "):
+            (
+                event_id,
+                user_id,
+                scheduled_time,
+                event_type,
+                payload,
+                executed,
+                cron_job_id,
+                created_at,
+                updated_at,
+            ) = args
+            row = {
+                "id": event_id,
+                "user_id": user_id,
+                "scheduled_time": scheduled_time,
+                "event_type": event_type,
+                "payload": deepcopy(payload),
+                "executed": executed,
+                "cron_job_id": cron_job_id,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "last_error": None,
+                "last_attempt_at": None,
+            }
+            self._db["events"][event_id] = row
+            return deepcopy(row)
+
+        if "FROM events WHERE user_id = $1 AND event_type = $2 AND scheduled_time = $3" in q:
+            user_id, event_type, scheduled_time = args
+            for row in self._db["events"].values():
+                if (
+                    row.get("user_id") == user_id
+                    and row.get("event_type") == event_type
+                    and row.get("scheduled_time") == scheduled_time
+                ):
+                    return deepcopy(row)
+            return None
+
+        if q == "SELECT * FROM events WHERE id = $1":
+            row = self._db["events"].get(args[0])
+            return deepcopy(row) if row else None
+
+        if "FROM events WHERE user_id = $1 AND event_type = 'morning_wake'" in q:
+            user_id, seed_date = args
+            matches = []
+            for row in self._db["events"].values():
+                payload = row.get("payload") or {}
+                if (
+                    row.get("user_id") == user_id
+                    and row.get("event_type") == "morning_wake"
+                    and row.get("executed") is False
+                    and payload.get("seed_date") == seed_date
+                ):
+                    matches.append(deepcopy(row))
+            matches.sort(key=lambda x: x.get("scheduled_time"))
+            return matches[0] if matches else None
+
+        raise NotImplementedError(f"Unhandled fetchrow query: {q}")
+
+    async def fetch(self, query: str, *args):
+        q = " ".join(query.split())
+
+        if q == "SELECT * FROM users ORDER BY created_at ASC":
+            rows = [deepcopy(row) for row in self._db["users"].values()]
+            rows.sort(key=lambda x: x.get("created_at"))
+            return rows
+
+        if "FROM events WHERE executed = FALSE AND cron_job_id IS NULL" in q:
+            now_utc, limit = args
+            rows = [
+                deepcopy(row)
+                for row in self._db["events"].values()
+                if row.get("executed") is False
+                and row.get("cron_job_id") is None
+                and row.get("scheduled_time") > now_utc
+            ]
+            rows.sort(key=lambda x: x.get("scheduled_time"))
+            return rows[:limit]
+
+        raise NotImplementedError(f"Unhandled fetch query: {q}")
+
+    async def execute(self, query: str, *args):
+        q = " ".join(query.split())
+
+        if q == "DELETE FROM push_tokens WHERE user_id = $1":
+            deleted = self._db["push_tokens"].pop(args[0], None)
+            return "DELETE 1" if deleted else "DELETE 0"
+
+        if q == "UPDATE events SET cron_job_id = $2, updated_at = $3 WHERE id = $1":
+            event_id, cron_job_id, updated_at = args
+            row = self._db["events"].get(event_id)
+            if not row:
+                return "UPDATE 0"
+            row["cron_job_id"] = cron_job_id
+            row["updated_at"] = updated_at
+            return "UPDATE 1"
+
+        if q == "UPDATE events SET executed = TRUE, updated_at = $2 WHERE id = $1":
+            event_id, updated_at = args
+            row = self._db["events"].get(event_id)
+            if not row:
+                return "UPDATE 0"
+            row["executed"] = True
+            row["updated_at"] = updated_at
+            return "UPDATE 1"
+
+        if q.startswith("UPDATE users SET "):
+            user_id = args[0]
+            row = self._db["users"].get(user_id)
+            if not row:
+                return "UPDATE 0"
+            set_part = q.split(" SET ", 1)[1].split(" WHERE user_id = $1", 1)[0]
+            assignments = [x.strip() for x in set_part.split(",")]
+            for assignment in assignments:
+                col, ref = assignment.split(" = ")
+                idx = int(ref.replace("$", "")) - 1
+                row[col] = deepcopy(args[idx])
+            return "UPDATE 1"
+
+        if q.startswith("UPDATE events SET "):
+            event_id = args[0]
+            row = self._db["events"].get(event_id)
+            if not row:
+                return "UPDATE 0"
+            set_part = q.split(" SET ", 1)[1].split(" WHERE id = $1", 1)[0]
+            assignments = [x.strip() for x in set_part.split(",")]
+            for assignment in assignments:
+                col, ref = assignment.split(" = ")
+                idx = int(ref.replace("$", "").replace("::jsonb", "")) - 1
+                col = col.replace("::jsonb", "")
+                row[col] = deepcopy(args[idx])
+            return "UPDATE 1"
+
+        raise NotImplementedError(f"Unhandled execute query: {q}")
 
 
 @pytest.fixture
-def fake_firestore(monkeypatch):
-    db = FakeFirestore()
-    monkeypatch.setattr(user_repo, "get_firestore", lambda: db)
-    monkeypatch.setattr(session_repo, "get_firestore", lambda: db)
-    monkeypatch.setattr(event_repo, "get_firestore", lambda: db)
-    return db
+def fake_pool(monkeypatch):
+    pool = FakePool()
+
+    async def _get_pool():
+        return pool
+
+    monkeypatch.setattr(user_repo, "get_pool", _get_pool)
+    monkeypatch.setattr(session_repo, "get_pool", _get_pool)
+    monkeypatch.setattr(event_repo, "get_pool", _get_pool)
+    return pool
 
 
 @pytest.mark.asyncio
-async def test_user_repo_profile_and_push_token_round_trip(fake_firestore):
-    _ = fake_firestore
+async def test_user_repo_profile_and_push_token_round_trip(fake_pool):
+    _ = fake_pool
 
     created = await user_repo.create_profile(
         user_id="user_a",
@@ -160,8 +294,8 @@ async def test_user_repo_profile_and_push_token_round_trip(fake_firestore):
 
 
 @pytest.mark.asyncio
-async def test_session_repo_upsert_save_and_lookup(fake_firestore):
-    _ = fake_firestore
+async def test_session_repo_upsert_save_and_lookup(fake_pool):
+    _ = fake_pool
 
     await session_repo.upsert_session(
         session_id="session_1",
@@ -171,7 +305,7 @@ async def test_session_repo_upsert_save_and_lookup(fake_firestore):
     )
     await session_repo.save_session(
         session_id="session_1",
-        state={"step": 2},
+        state={"step": 2, "user_id": "user_a", "date": "2026-02-08"},
     )
 
     by_id = await session_repo.get_session("session_1")
@@ -184,8 +318,8 @@ async def test_session_repo_upsert_save_and_lookup(fake_firestore):
 
 
 @pytest.mark.asyncio
-async def test_event_repo_lifecycle_and_queries(fake_firestore):
-    _ = fake_firestore
+async def test_event_repo_lifecycle_and_queries(fake_pool):
+    _ = fake_pool
 
     now = datetime.now(timezone.utc)
     future_time = now + timedelta(hours=1)
@@ -215,7 +349,6 @@ async def test_event_repo_lifecycle_and_queries(fake_firestore):
     )
     assert by_type_time is not None
 
-    # Future event missing cron for reconciliation query
     missing_cron = await event_repo.create_event(
         user_id="user_a",
         scheduled_time=now + timedelta(hours=2),
@@ -223,7 +356,6 @@ async def test_event_repo_lifecycle_and_queries(fake_firestore):
         payload={"reason": "reconcile"},
         cron_job_id=None,
     )
-    # Past event should be filtered out from reconciliation query
     await event_repo.create_event(
         user_id="user_a",
         scheduled_time=now - timedelta(hours=2),

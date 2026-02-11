@@ -12,10 +12,12 @@ import os
 import re
 import warnings
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
+from composio import Composio
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables BEFORE importing agent
@@ -38,12 +40,12 @@ from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.genai import types
 from context import current_session_id, current_user_id, current_user_timezone
 
-# New imports for Cron Endpoints
-from fastapi import HTTPException
+from auth import AuthUser, get_authenticated_user, verify_supabase_jwt
 from repos import event_repo, user_repo
 from datetime import datetime, timedelta, time, timezone
 from agent_runtime import AgentRuntime
 import cron_service
+from db import close_pool
 
 # Configure logging
 logging.basicConfig(
@@ -91,6 +93,24 @@ app.add_middleware(
 # Session and Runner setup
 session_manager = ADKSessionManager()
 runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_manager.service)
+
+
+def _get_composio_client() -> Composio:
+    api_key = os.getenv("COMPOSIO_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="COMPOSIO_API_KEY is not configured",
+        )
+    return Composio(api_key=api_key)
+
+
+def _composio_apps() -> list[str]:
+    raw_apps = os.getenv(
+        "COMPOSIO_REQUIRED_APPS",
+        "googlecalendar,googletasks",
+    )
+    return [name.strip() for name in raw_apps.split(",") if name.strip()]
 
 
 def _is_live_transient_error(error: Exception) -> bool:
@@ -220,16 +240,30 @@ def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str
     return requested_session_id
 
 
-def _normalize_timezone(timezone_name: str | None, fallback: str = "UTC") -> str:
-    """Return a valid IANA timezone or fallback."""
+def _normalize_timezone(timezone_name: str | None) -> str | None:
+    """Return valid IANA timezone or None when unavailable/invalid."""
     if not timezone_name:
-        return fallback
+        return None
     try:
         ZoneInfo(timezone_name)
         return timezone_name
     except Exception:
-        logger.warning(f"Invalid timezone '{timezone_name}'. Falling back to {fallback}.")
-        return fallback
+        logger.warning("Invalid timezone '%s'.", timezone_name)
+        return None
+
+
+def _require_timezone(timezone_name: str | None, *, context: str) -> str:
+    normalized = _normalize_timezone(timezone_name)
+    if not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_timezone",
+                "context": context,
+                "message": "A valid IANA timezone is required.",
+            },
+        )
+    return normalized
 
 
 def _next_morning_wake_datetime(
@@ -239,7 +273,7 @@ def _next_morning_wake_datetime(
     Compute next local morning wake datetime for a user.
     If today's wake time already passed, schedule for tomorrow.
     """
-    tz = ZoneInfo(user_timezone or "UTC")
+    tz = ZoneInfo(user_timezone)
     now_local = datetime.now(tz)
     parsed_wake_time = _parse_wake_time(wake_time_raw)
     if not parsed_wake_time:
@@ -254,7 +288,7 @@ def _next_morning_wake_datetime(
 
 
 def _as_datetime(value) -> datetime | None:
-    """Best-effort conversion for Firestore datetime fields."""
+    """Best-effort conversion for persisted datetime fields."""
     if isinstance(value, datetime):
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
@@ -305,7 +339,7 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
             not existing_cron_job_id
             or not existing_scheduled
             or abs((existing_scheduled - target_local).total_seconds()) >= 60
-            or _normalize_timezone(existing_payload.get("timezone"), "") != user_timezone
+            or _normalize_timezone(existing_payload.get("timezone")) != user_timezone
         )
 
         if should_reschedule:
@@ -329,6 +363,8 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
                     "reason": "daily_bootstrap",
                     "seed_date": seed_date,
                     "timezone": user_timezone,
+                    "schedule_owner": "system",
+                    "schedule_policy": "morning_bootstrap",
                 },
                 executed=False,
                 cron_job_id=cron_job_id,
@@ -347,6 +383,8 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
             "reason": "daily_bootstrap",
             "seed_date": seed_date,
             "timezone": user_timezone,
+            "schedule_owner": "system",
+            "schedule_policy": "morning_bootstrap",
         },
     )
     event_id = _event_field(created, "id")
@@ -367,28 +405,54 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
 
 async def _reconcile_missing_cron_jobs() -> None:
     """
-    Backfill cron jobs for future events that were created but failed to schedule.
+    Backfill cron jobs for missing system-owned morning bootstrap events only.
+
+    Autonomy boundary:
+    - We do NOT recreate arbitrary future timers at startup.
+    - We only repair the deterministic morning wake invariant.
     """
     missing_events = await event_repo.list_future_unexecuted_events_missing_cron(limit=200)
     if not missing_events:
         return
 
-    logger.info(f"[cron-reconcile] Found {len(missing_events)} events missing cron_job_id")
+    logger.info(
+        f"[cron-reconcile] Evaluating {len(missing_events)} events missing cron_job_id "
+        "for morning-bootstrap reconciliation"
+    )
     for event in missing_events:
         try:
             event_id = _event_field(event, "id")
             if not event_id:
                 continue
+            event_type = _event_field(event, "event_type", "")
+            payload = _event_field(event, "payload", {}) or {}
+            owner = payload.get("schedule_owner")
+            reason = payload.get("reason")
+            policy = payload.get("schedule_policy")
+            if event_type != "morning_wake":
+                continue
+            if owner not in ("system", None):
+                continue
+            if reason != "daily_bootstrap":
+                continue
+            if policy not in ("morning_bootstrap", None):
+                continue
+
             scheduled_time = _as_datetime(_event_field(event, "scheduled_time"))
             if not scheduled_time:
                 continue
 
-            payload = _event_field(event, "payload", {}) or {}
             timezone_name = payload.get("timezone")
             if not timezone_name:
                 profile = await user_repo.get_profile(_event_field(event, "user_id", ""))
-                timezone_name = (profile or {}).get("timezone", "UTC")
-            timezone_name = _normalize_timezone(timezone_name, "UTC")
+                timezone_name = (profile or {}).get("timezone")
+            timezone_name = _normalize_timezone(timezone_name)
+            if not timezone_name:
+                logger.warning(
+                    "[cron-reconcile] Skipping event %s due to missing timezone",
+                    event_id,
+                )
+                continue
 
             cron_job_id = await cron_service.create_one_time_job(
                 target_datetime=scheduled_time,
@@ -396,6 +460,10 @@ async def _reconcile_missing_cron_jobs() -> None:
                 timezone=timezone_name,
             )
             await event_repo.update_cron_job_id(event_id, cron_job_id)
+            payload_updates = dict(payload)
+            payload_updates.setdefault("schedule_owner", "system")
+            payload_updates.setdefault("schedule_policy", "morning_bootstrap")
+            await event_repo.update_event(event_id, payload=payload_updates)
             logger.info(
                 f"[cron-reconcile] Backfilled cron job for event {event_id}: {cron_job_id}"
             )
@@ -423,9 +491,10 @@ async def health():
 # User Preferences Endpoints
 # ========================================
 
-@app.get("/api/preferences/{user_id}")
-async def get_user_preferences(user_id: str):
+@app.get("/api/preferences/me")
+async def get_user_preferences(current_user: AuthUser = Depends(get_authenticated_user)):
     """Read persisted user preferences."""
+    user_id = current_user.user_id
     profile = await user_repo.get_profile(user_id)
     if not profile:
         return {
@@ -449,9 +518,13 @@ async def get_user_preferences(user_id: str):
     }
 
 
-@app.put("/api/preferences/{user_id}")
-async def update_user_preferences(user_id: str, payload: dict):
+@app.put("/api/preferences/me")
+async def update_user_preferences(
+    payload: dict,
+    current_user: AuthUser = Depends(get_authenticated_user),
+):
     """Create/update user preferences and re-sync morning wake scheduling."""
+    user_id = current_user.user_id
     sanitized, errors = _validate_preferences_payload(payload)
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
@@ -486,13 +559,97 @@ async def update_user_preferences(user_id: str, payload: dict):
 
 
 # ========================================
+# Composio Integration Endpoints
+# ========================================
+
+@app.post("/api/integrations/composio/connect-link")
+async def create_composio_connect_link(
+    payload: dict,
+    current_user: AuthUser = Depends(get_authenticated_user),
+):
+    redirect_url_raw = payload.get("redirect_url")
+    requested_app = payload.get("app")
+    redirect_url = redirect_url_raw if isinstance(redirect_url_raw, str) and redirect_url_raw.strip() else None
+    apps = [requested_app] if isinstance(requested_app, str) and requested_app.strip() else _composio_apps()
+    try:
+        entity = _get_composio_client().get_entity(current_user.user_id)
+        links: list[dict] = []
+        for app_name in apps:
+            request = entity.initiate_connection(
+                app_name=app_name,
+                redirect_url=redirect_url,
+            )
+            links.append(
+                {
+                    "app": app_name,
+                    "connection_status": request.connectionStatus,
+                    "connected_account_id": request.connectedAccountId,
+                    "redirect_url": request.redirectUrl,
+                }
+            )
+        return {
+            "status": "ok",
+            "user_id": current_user.user_id,
+            "links": links,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to create Composio connect links")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/integrations/composio/status")
+async def get_composio_status(current_user: AuthUser = Depends(get_authenticated_user)):
+    try:
+        entity = _get_composio_client().get_entity(current_user.user_id)
+        connections = entity.get_connections()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to read Composio connection status")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    required_apps = _composio_apps()
+    statuses: list[dict] = []
+    for app_name in required_apps:
+        app_connections = [
+            conn
+            for conn in connections
+            if str(getattr(conn, "appName", "")).lower() == app_name.lower()
+        ]
+        active_conn = next(
+            (
+                conn
+                for conn in app_connections
+                if str(getattr(conn, "status", "")).upper() == "ACTIVE"
+            ),
+            None,
+        )
+        statuses.append(
+            {
+                "app": app_name,
+                "connected": active_conn is not None,
+                "status": str(getattr(active_conn, "status", "NOT_CONNECTED")),
+                "connected_account_id": getattr(active_conn, "id", None),
+            }
+        )
+
+    return {
+        "status": "ok",
+        "user_id": current_user.user_id,
+        "apps": statuses,
+        "all_connected": all(item["connected"] for item in statuses),
+    }
+
+
+# ========================================
 # Cron Endpoints
 # ========================================
 
+
 @app.post("/api/execute-event/{event_id}")
-async def execute_event(
-    event_id: str
-):
+async def execute_event(event_id: str):
     """
     Execute a specific scheduled event.
     Called by cron-jobs.org at the scheduled time.
@@ -521,7 +678,7 @@ async def execute_event(
     event_type = _event_field(event, "event_type", "checkin")
     payload = _event_field(event, "payload", {}) or {}
     reason = payload.get("reason")
-    event_timezone = _normalize_timezone(payload.get("timezone"), fallback="")
+    event_timezone = _normalize_timezone(payload.get("timezone"))
     if not event_timezone:
         try:
             profile = await user_repo.get_profile(_event_field(event, "user_id", ""))
@@ -530,7 +687,16 @@ async def execute_event(
                 f"[execute-event] Failed to load profile timezone for {_event_field(event, 'user_id', '')}: {profile_error}"
             )
             profile = None
-        event_timezone = _normalize_timezone((profile or {}).get("timezone"), "UTC")
+        event_timezone = _normalize_timezone((profile or {}).get("timezone"))
+    if not event_timezone:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "missing_timezone",
+                "event_id": event_id,
+                "message": "Cannot execute scheduled event without user timezone.",
+            },
+        )
 
     if event_type == "morning_wake":
         trigger_prompt = "You just woke up."
@@ -649,19 +815,19 @@ async def execute_event(
 
 @app.post("/api/save-token")
 async def save_push_token(
-    payload: dict
+    payload: dict,
+    current_user: AuthUser = Depends(get_authenticated_user),
 ):
     """
     Saves the user's Expo push token.
-    Payload expected: {"user_id": "...", "token": "..."}
+    Payload expected: {"token": "..."}
     """
-    import re
-    
-    user_id = payload.get("user_id")
+
+    user_id = current_user.user_id
     token = payload.get("token")
     
-    if not user_id or not token:
-        raise HTTPException(status_code=400, detail="Missing user_id or token")
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing token")
     
     # Validate Expo token format
     if not re.match(r'^ExponentPushToken\[.+\]$', token):
@@ -676,7 +842,7 @@ async def reliability_bootstrap() -> None:
     """
     Reliability bootstrap:
     1) Ensure each user has a pending next-morning wake event + cron
-    2) Reconcile future events that are missing cron_job_id
+    2) Optionally reconcile missing morning-bootstrap cron jobs only
     """
     if os.getenv("ENABLE_RELIABILITY_BOOTSTRAP", "true").lower() not in (
         "1",
@@ -699,214 +865,203 @@ async def reliability_bootstrap() -> None:
     except Exception as e:
         logger.warning(f"[bootstrap] Failed to seed morning wakes: {e}")
 
+    if os.getenv("ENABLE_MORNING_CRON_RECONCILE", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        try:
+            await _reconcile_missing_cron_jobs()
+        except Exception as e:
+            logger.warning(f"[bootstrap] Failed cron reconciliation: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_cleanup() -> None:
+    """Cleanup async resources."""
     try:
-        await _reconcile_missing_cron_jobs()
+        await close_pool()
     except Exception as e:
-        logger.warning(f"[bootstrap] Failed cron reconciliation: {e}")
+        logger.warning(f"[shutdown] Failed to close DB pool: {e}")
 
 
-@app.websocket("/ws/{user_id}/{session_id}")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    user_id: str,
-    session_id: str,
-) -> None:
-    """
-    WebSocket endpoint for bidirectional streaming with ADK.
-    
-    Args:
-        websocket: The WebSocket connection
-        user_id: User identifier
-        session_id: Session identifier
-    """
-    logger.info(f"WebSocket connection request: user_id={user_id}, session_id={session_id}")
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
+    """WebSocket endpoint for bidirectional streaming with Supabase-authenticated init."""
+    logger.info("WebSocket connection request: session_id=%s", session_id)
     await websocket.accept()
     logger.info("WebSocket connection accepted")
 
-    # Override session_id with the deterministic daily ID
-    # This aligns the WebSocket connection with the same session used by cron/background agent.
-    # We ignore the client-provided session_id (which is often random or stale).
-    unified_session_id = _select_ws_session_id(user_id, session_id)
-    logger.info(f"Map WebSocket connection to Unified Session ID: {unified_session_id}")
-
-    # Set context variables for this request/connection
-    current_user_id.set(user_id)
-    current_session_id.set(unified_session_id)
-
-    # ========================================
-    # Session Initialization
-    # ========================================
-    
-    # Determine response modality based on Conversation Mode (Live API)
-    # Conversation Mode: Audio/Video
-    run_config = AgentRuntime.get_conversation_mode_config()
-    logger.info(f"Using Conversation Mode (AUDIO) for session: {unified_session_id}")
-
-    # Get or create session
-    session = await session_manager.get_or_create_session(
-        app_name=APP_NAME, user_id=user_id, session_id=unified_session_id
-    )
-    try:
-        profile = await user_repo.get_profile(user_id)
-    except Exception as profile_error:
-        logger.warning(f"[WS-INIT] Failed to load profile for {user_id}: {profile_error}")
-        profile = None
-    profile_timezone = _normalize_timezone((profile or {}).get("timezone"), "UTC")
-    current_user_timezone.set(profile_timezone)
-    session.state.setdefault("user_timezone", profile_timezone)
-
+    user_id: Optional[str] = None
+    unified_session_id: Optional[str] = None
+    session = None
     live_request_queue = LiveRequestQueue()
-    logger.info(f"WebSocket model: {agent.model}")
-    
-    # Create UI event queue for this connection
     ui_event_queue = asyncio.Queue()
     set_ui_event_queue(ui_event_queue)
-    logger.info("UI event queue created for this connection")
+    run_config = AgentRuntime.get_conversation_mode_config()
 
-    # ========================================
-    # Bidirectional Streaming Tasks
-    # ========================================
+    try:
+        first_message = await asyncio.wait_for(websocket.receive(), timeout=20.0)
+        if first_message.get("type") == "websocket.disconnect":
+            logger.info("WebSocket disconnected before init")
+            return
+        if first_message.get("text") is None:
+            await websocket.close(code=4400, reason="init payload required")
+            return
 
-    async def upstream_task() -> None:
-        """Receives messages from WebSocket and sends to LiveRequestQueue."""
-        logger.debug("upstream_task started")
-        init_handled = False
-        
         try:
-            while True:
-                message = await websocket.receive()
-                
-                # Handle disconnect
-                if message.get("type") == "websocket.disconnect":
-                    logger.info("WebSocket disconnect received in upstream_task")
-                    break
+            init_message = json.loads(first_message["text"])
+        except json.JSONDecodeError:
+            await websocket.close(code=4400, reason="invalid init payload")
+            return
 
-                # Handle binary frames (audio data)
-                audio_data = message.get("bytes")
-                if audio_data is not None:
-                    logger.debug(f"Received audio chunk: {len(audio_data)} bytes")
-                    audio_blob = types.Blob(
-                        mime_type="audio/pcm;rate=16000", data=audio_data
-                    )
-                    live_request_queue.send_realtime(audio_blob)
+        if init_message.get("type") != "init":
+            await websocket.close(code=4400, reason="first message must be init")
+            return
 
-                # Handle text frames (JSON messages)
-                elif message.get("text") is not None:
-                    text_data = message["text"]
-                    logger.debug(f"Received text message: {text_data[:100]}...")
-                    
+        access_token = init_message.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            await websocket.close(code=4401, reason="missing access_token")
+            return
+
+        try:
+            auth_user = await verify_supabase_jwt(access_token.strip())
+        except HTTPException:
+            await websocket.close(code=4401, reason="invalid access_token")
+            return
+
+        user_id = auth_user.user_id
+        resume_session_id = init_message.get("resume_session_id")
+        requested_session_id = (
+            resume_session_id
+            if isinstance(resume_session_id, str) and resume_session_id.strip()
+            else session_id
+        )
+        unified_session_id = _select_ws_session_id(user_id, requested_session_id)
+
+        logger.info(
+            "[WS-INIT] Authenticated websocket user=%s, session=%s",
+            user_id,
+            unified_session_id,
+        )
+
+        current_user_id.set(user_id)
+        current_session_id.set(unified_session_id)
+
+        session = await session_manager.get_or_create_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=unified_session_id,
+        )
+
+        try:
+            profile = await user_repo.get_profile(user_id)
+        except Exception as profile_error:
+            logger.warning("[WS-INIT] Failed to load profile for %s: %s", user_id, profile_error)
+            profile = None
+
+        trigger_type = init_message.get("trigger_type")
+        if isinstance(trigger_type, str) and trigger_type:
+            session.state["trigger_type"] = trigger_type
+
+        client_timezone = _normalize_timezone(init_message.get("timezone"))
+        profile_timezone = _normalize_timezone((profile or {}).get("timezone"))
+        resolved_timezone = client_timezone or profile_timezone
+        current_user_timezone.set(resolved_timezone)
+        if resolved_timezone:
+            session.state["user_timezone"] = resolved_timezone
+            try:
+                await user_repo.update_profile(user_id, timezone=resolved_timezone)
+            except Exception as profile_update_error:
+                logger.warning(
+                    "[WS-INIT] Failed to persist timezone for %s: %s",
+                    user_id,
+                    profile_update_error,
+                )
+
+        activation_message = types.Content(
+            role="user",
+            parts=[
+                types.Part(text="Start with a brief greeting, then ask how you can help."),
+            ],
+        )
+        live_request_queue.send_content(activation_message)
+        logger.info("[WS-INIT] Sent activation message")
+
+        async def upstream_task() -> None:
+            """Receives messages from WebSocket and sends to LiveRequestQueue."""
+            logger.debug("upstream_task started")
+            try:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        logger.info("WebSocket disconnect received in upstream_task")
+                        break
+
+                    audio_data = message.get("bytes")
+                    if audio_data is not None:
+                        audio_blob = types.Blob(
+                            mime_type="audio/pcm;rate=16000",
+                            data=audio_data,
+                        )
+                        live_request_queue.send_realtime(audio_blob)
+                        continue
+
+                    text_data = message.get("text")
+                    if text_data is None:
+                        continue
+
                     try:
                         json_message = json.loads(text_data)
-                        
-                        # Handle init message (should be first message from client)
-                        if json_message.get("type") == "init" and not init_handled:
-                            init_handled = True
-                            resume_session_id = json_message.get("resume_session_id")
-                            trigger_type = json_message.get("trigger_type")
-                            client_timezone = _normalize_timezone(
-                                json_message.get("timezone"), profile_timezone
-                            )
-                            
-                            logger.info(
-                                "[WS-INIT] Received init handshake - "
-                                f"resume_session_id: {resume_session_id}, "
-                                f"trigger_type: {trigger_type}, "
-                                f"timezone: {client_timezone}"
-                            )
-                            
-                            # Store trigger_type in session state for agent context
-                            if trigger_type:
-                                session.state["trigger_type"] = trigger_type
-                                logger.info(f"[WS-INIT] Stored trigger_type in session: {trigger_type}")
-
-                            session.state["user_timezone"] = client_timezone
-                            current_user_timezone.set(client_timezone)
-                            try:
-                                await user_repo.update_profile(user_id, timezone=client_timezone)
-                                logger.info(
-                                    f"[WS-INIT] Stored user timezone in session/profile: {client_timezone}"
-                                )
-                            except Exception as profile_update_error:
-                                logger.warning(
-                                    f"[WS-INIT] Failed to persist timezone for {user_id}: {profile_update_error}"
-                                )
-                            
-                            if resume_session_id and resume_session_id != unified_session_id:
-                                logger.info(
-                                    f"[WS-INIT] Received resume_session_id={resume_session_id}, "
-                                    f"using session_id={unified_session_id}"
-                                )
-
-                            # Agent-first greeting turn, always sent after init.
-                            activation_message = types.Content(
-                                role="user",
-                                parts=[
-                                    types.Part(
-                                        text=(
-                                            "Start with a brief greeting, then ask how you can help."
-                                        )
-                                    )
-                                ],
-                            )
-                            live_request_queue.send_content(activation_message)
-                            logger.info("[WS-INIT] Sent activation message")
-                            
-                            continue  # Don't process init message further
-                        
-                        if json_message.get("type") == "text":
-                            content = types.Content(
-                                parts=[types.Part(text=json_message["text"])]
-                            )
-                            live_request_queue.send_content(content)
                     except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON received: {text_data}")
-        except Exception as e:
-            logger.debug(f"upstream_task ended: {e}")
+                        logger.warning("Invalid JSON received")
+                        continue
 
-    async def _process_downstream_event(event) -> bool:
-        """Process one ADK event and forward to frontend. Returns False on closed socket."""
-        # Explicitly check and log transcriptions
-        if hasattr(event, "server_content") and event.server_content:
-            if (
-                hasattr(event.server_content, "input_transcription")
-                and event.server_content.input_transcription
-            ):
-                logger.info(
-                    f"[TRANSCRIPTION-INPUT] User: {event.server_content.input_transcription.text}"
-                )
+                    if json_message.get("type") == "text":
+                        content = types.Content(parts=[types.Part(text=json_message["text"])])
+                        live_request_queue.send_content(content)
+            except Exception as e:
+                logger.debug("upstream_task ended: %s", e)
 
-            if (
-                hasattr(event.server_content, "output_transcription")
-                and event.server_content.output_transcription
-            ):
-                logger.info(
-                    f"[TRANSCRIPTION-OUTPUT] Agent: {event.server_content.output_transcription.text}"
-                )
+        async def _process_downstream_event(event) -> bool:
+            """Process one ADK event and forward to frontend. Returns False on closed socket."""
+            if hasattr(event, "server_content") and event.server_content:
+                if (
+                    hasattr(event.server_content, "input_transcription")
+                    and event.server_content.input_transcription
+                ):
+                    logger.info(
+                        "[TRANSCRIPTION-INPUT] User: %s",
+                        event.server_content.input_transcription.text,
+                    )
 
-        # Log every event with content
-        if event.content and event.content.parts:
-            for i, part in enumerate(event.content.parts):
-                part_attrs = [
-                    a
-                    for a in ["text", "function_call", "function_response", "inline_data"]
-                    if getattr(part, a, None) is not None
-                ]
-                if part_attrs:
-                    logger.info(f"[MAIN-EVENT] Part {i} has: {part_attrs}")
+                if (
+                    hasattr(event.server_content, "output_transcription")
+                    and event.server_content.output_transcription
+                ):
+                    logger.info(
+                        "[TRANSCRIPTION-OUTPUT] Agent: %s",
+                        event.server_content.output_transcription.text,
+                    )
 
-                func_resp = getattr(part, "function_response", None)
-                if func_resp is not None:
+            if event.content and event.content.parts:
+                for i, part in enumerate(event.content.parts):
+                    part_attrs = [
+                        a
+                        for a in ["text", "function_call", "function_response", "inline_data"]
+                        if getattr(part, a, None) is not None
+                    ]
+                    if part_attrs:
+                        logger.info("[MAIN-EVENT] Part %s has: %s", i, part_attrs)
+
+                    func_resp = getattr(part, "function_response", None)
+                    if func_resp is None:
+                        continue
                     func_name = getattr(func_resp, "name", "unknown")
                     response_data = getattr(func_resp, "response", None)
-
-                    logger.info(f"[MAIN-UI] Found function_response: {func_name}")
-
                     if func_name == "generative_ui" and isinstance(response_data, dict):
                         ui_payload = response_data.get("ui_payload")
                         if ui_payload:
-                            logger.info(
-                                f"[MAIN-UI] >>> Detected ui_payload: component={ui_payload.get('type', 'unknown')}"
-                            )
                             ui_event = {
                                 "type": "generative_ui",
                                 "component": ui_payload.get("type"),
@@ -914,132 +1069,113 @@ async def websocket_endpoint(
                             }
                             try:
                                 await websocket.send_text(json.dumps(ui_event))
-                                logger.info(
-                                    f"[MAIN-UI] <<< SENT generative_ui WebSocket event: {ui_payload.get('type')}"
-                                )
                             except (RuntimeError, WebSocketDisconnect):
-                                logger.warning(
-                                    "[MAIN-UI] WebSocket closed while sending UI event"
-                                )
+                                logger.warning("[MAIN-UI] WebSocket closed while sending UI event")
 
-        event_json = event.model_dump_json(exclude_none=True, by_alias=True)
-        if hasattr(event, "server_content") and event.server_content:
-            logger.debug(
-                "[TRANSCRIPTION-JSON-SAMPLE] Sending event with serverContent fields"
-            )
-
-        logger.debug("Sending event to client")
-        try:
-            await websocket.send_text(event_json)
-        except (RuntimeError, WebSocketDisconnect):
-            logger.info("WebSocket connection closed, stopping downstream_task")
-            return False
-
-        try:
-            await session_manager.save_agent_session_to_db(
-                unified_session_id, session.state, user_id=user_id
-            )
-        except Exception as e:
-            logger.warning(f"Failed to persist session state: {e}")
-
-        return True
-
-    async def downstream_task() -> None:
-        """Receives Events from run_live() and sends to WebSocket."""
-        logger.debug("downstream_task started")
-        max_retries = 2
-        model_name = str(agent.model)
-        logger.info(f"[LIVE] Attempting run_live with conversation model: {model_name}")
-
-        for attempt in range(1, max_retries + 1):
+            event_json = event.model_dump_json(exclude_none=True, by_alias=True)
             try:
-                async for event in runner.run_live(
+                await websocket.send_text(event_json)
+            except (RuntimeError, WebSocketDisconnect):
+                logger.info("WebSocket connection closed, stopping downstream_task")
+                return False
+
+            try:
+                assert unified_session_id is not None
+                assert user_id is not None
+                await session_manager.save_agent_session_to_db(
+                    unified_session_id,
+                    session.state,
                     user_id=user_id,
-                    session_id=unified_session_id,
-                    live_request_queue=live_request_queue,
-                    run_config=run_config,
-                ):
-                    should_continue = await _process_downstream_event(event)
-                    if not should_continue:
-                        return
-                return
+                )
             except Exception as e:
-                is_last_attempt = attempt == max_retries
-                if _is_live_transient_error(e) and not is_last_attempt:
-                    backoff_seconds = 2 ** (attempt - 1)
-                    logger.warning(
-                        f"[LIVE] Transient live error with model '{model_name}' "
-                        f"(attempt {attempt}/{max_retries}): {e}. "
-                        f"Retrying in {backoff_seconds}s."
-                    )
-                    await asyncio.sleep(backoff_seconds)
-                    continue
-                raise
+                logger.warning("Failed to persist session state: %s", e)
 
-    async def ui_event_task() -> None:
-        """Reads UI events from queue and sends to WebSocket."""
-        logger.info("ui_event_task started")
-        while True:
-            try:
-                # Wait for UI event with timeout to allow checking for disconnect
-                ui_event = await asyncio.wait_for(ui_event_queue.get(), timeout=1.0)
-                logger.info(f"[UI-TASK] Got UI event from queue: {ui_event.get('component')}")
+            return True
+
+        async def downstream_task() -> None:
+            """Receives Events from run_live() and sends to WebSocket."""
+            logger.debug("downstream_task started")
+            max_retries = 2
+            model_name = str(agent.model)
+            logger.info("[LIVE] Attempting run_live with conversation model: %s", model_name)
+
+            for attempt in range(1, max_retries + 1):
                 try:
-                    await websocket.send_text(json.dumps(ui_event))
-                    logger.info(f"[UI-TASK] <<< SENT generative_ui WebSocket event: {ui_event.get('component')}")
-                except (RuntimeError, WebSocketDisconnect):
-                    logger.info("WebSocket closed, stopping ui_event_task")
-                    break
-            except asyncio.TimeoutError:
-                # Check if we should stop
-                if websocket.client_state.name != "CONNECTED":
-                    logger.info("WebSocket no longer connected, stopping ui_event_task")
-                    break
-            except Exception as e:
-                logger.error(f"Error in ui_event_task: {e}")
-                break
+                    assert user_id is not None
+                    assert unified_session_id is not None
+                    async for event in runner.run_live(
+                        user_id=user_id,
+                        session_id=unified_session_id,
+                        live_request_queue=live_request_queue,
+                        run_config=run_config,
+                    ):
+                        should_continue = await _process_downstream_event(event)
+                        if not should_continue:
+                            return
+                    return
+                except Exception as e:
+                    is_last_attempt = attempt == max_retries
+                    if _is_live_transient_error(e) and not is_last_attempt:
+                        backoff_seconds = 2 ** (attempt - 1)
+                        logger.warning(
+                            "[LIVE] Transient live error with model '%s' (attempt %s/%s): %s. "
+                            "Retrying in %ss.",
+                            model_name,
+                            attempt,
+                            max_retries,
+                            e,
+                            backoff_seconds,
+                        )
+                        await asyncio.sleep(backoff_seconds)
+                        continue
+                    raise
 
-    # Run all three tasks concurrently
-    try:
-        await asyncio.gather(upstream_task(), downstream_task(), ui_event_task())
-    except WebSocketDisconnect:
-        logger.info("Client disconnected")
-    except Exception as e:
-        logger.error(f"Error in streaming: {e}", exc_info=True)
+        async def ui_event_task() -> None:
+            """Reads UI events from queue and sends to WebSocket."""
+            while True:
+                try:
+                    ui_event = await asyncio.wait_for(ui_event_queue.get(), timeout=1.0)
+                    try:
+                        await websocket.send_text(json.dumps(ui_event))
+                    except (RuntimeError, WebSocketDisconnect):
+                        logger.info("WebSocket closed, stopping ui_event_task")
+                        break
+                except asyncio.TimeoutError:
+                    if websocket.client_state.name != "CONNECTED":
+                        break
+                except Exception as e:
+                    logger.error("Error in ui_event_task: %s", e)
+                    break
+
+        try:
+            await asyncio.gather(upstream_task(), downstream_task(), ui_event_task())
+        except WebSocketDisconnect:
+            logger.info("Client disconnected")
+        except Exception as e:
+            logger.error("Error in streaming: %s", e, exc_info=True)
     finally:
         logger.info("Closing live_request_queue")
         live_request_queue.close()
-        set_ui_event_queue(None)  # Clear the queue reference
-        
-        # ========================================
-        # POST-CONVERSATION THINKING TURN
-        # ========================================
-        logger.info("🧠 [POST-CONVERSATION] Triggering thinking mode after conversation ended")
-        
-        try:
-            # Trigger thinking mode to:
-            # 1. Review what happened in the conversation
-            # 2. Check calendar for what's next
-            # 3. Set appropriate timer for next intervention
-            # Minimal trigger - agent uses tools to understand context
-            trigger_context = "Conversation just ended."
-            
-            async for _ in AgentRuntime.run_thinking_mode(
-                user_id=user_id,
-                trigger_context=trigger_context,
-                session_manager=session_manager,
-                timezone=_normalize_timezone(session.state.get("user_timezone"), "UTC"),
-            ):
-                pass  # We don't need to process the events, just let it run
-            
-            logger.info("✅ [POST-CONVERSATION] Thinking turn completed successfully")
-            
-        except Exception as thinking_error:
-            logger.error(
-                f"❌ [POST-CONVERSATION] Failed to run thinking turn: {thinking_error}",
-                exc_info=True
-            )
-            # Don't raise - we don't want to fail the WebSocket close due to this
+        set_ui_event_queue(None)
+
+        if session is not None and user_id:
+            logger.info("🧠 [POST-CONVERSATION] Triggering thinking mode after conversation ended")
+            try:
+                trigger_context = "Conversation just ended."
+                async for _ in AgentRuntime.run_thinking_mode(
+                    user_id=user_id,
+                    trigger_context=trigger_context,
+                    session_manager=session_manager,
+                    timezone=_normalize_timezone(session.state.get("user_timezone")),
+                ):
+                    pass
+                logger.info("✅ [POST-CONVERSATION] Thinking turn completed successfully")
+            except Exception as thinking_error:
+                logger.error(
+                    "❌ [POST-CONVERSATION] Failed to run thinking turn: %s",
+                    thinking_error,
+                    exc_info=True,
+                )
 
 
 # ========================================

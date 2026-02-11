@@ -1,6 +1,4 @@
-"""
-Unit tests for agent_runtime.py against current Firestore-era interfaces.
-"""
+"""Unit tests for agent_runtime.py against current repository interfaces."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 

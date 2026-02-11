@@ -8,4 +8,5 @@ websockets
 apscheduler>=3.10.0
 pytz>=2024.1
 httpx
-firebase-admin>=6.5.0
+asyncpg>=0.30.0
+PyJWT[crypto]>=2.10.1

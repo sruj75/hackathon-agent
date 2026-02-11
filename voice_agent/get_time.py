@@ -30,12 +30,10 @@ def get_current_time() -> dict:
         }
     except Exception as e:
         logger.error(f"Error getting current time: {e}", exc_info=True)
-        # Fallback to UTC
-        now = datetime.now(pytz.UTC)
         return {
-            "iso": now.isoformat(),
-            "readable": now.strftime("%-I:%M %p"),
-            "timezone": "UTC",
+            "iso": None,
+            "readable": None,
+            "timezone": None,
             "error": str(e)
         }
 
