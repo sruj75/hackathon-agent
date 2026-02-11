@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS public.users (
 );
 
 CREATE TABLE IF NOT EXISTS public.push_tokens (
-    user_id TEXT PRIMARY KEY,
+    user_id TEXT PRIMARY KEY REFERENCES public.users(user_id) ON DELETE CASCADE,
     expo_push_token TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -51,3 +51,5 @@ CREATE INDEX IF NOT EXISTS idx_events_reconcile
 
 CREATE INDEX IF NOT EXISTS idx_events_seed_date
     ON public.events ((payload->>'seed_date'));
+
+-- RLS + policies: see 002_auth_timezone_hardening.sql and 003_rls_user_policies.sql

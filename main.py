@@ -378,6 +378,36 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
         )
 
         if should_reschedule:
+            # Create-first: ensure event always has a cron job; delete old only after successful update
+            cron_job_id = await cron_service.create_one_time_job(
+                target_datetime=target_local,
+                event_id=event_id,
+                timezone=user_timezone,
+            )
+            try:
+                await event_repo.update_event(
+                    event_id,
+                    scheduled_time=target_local,
+                    payload={
+                        "reason": "daily_bootstrap",
+                        "seed_date": seed_date,
+                        "timezone": user_timezone,
+                        "schedule_owner": "system",
+                        "schedule_policy": "morning_bootstrap",
+                    },
+                    executed=False,
+                    cron_job_id=cron_job_id,
+                )
+            except Exception as update_error:
+                # Rollback: delete newly created orphan
+                try:
+                    await cron_service.delete_job(cron_job_id)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"[morning-bootstrap] Failed to cleanup orphan cron job {cron_job_id} after update failed: {cleanup_error}"
+                    )
+                raise update_error
+
             if existing_cron_job_id:
                 try:
                     await cron_service.delete_job(existing_cron_job_id)
@@ -385,25 +415,6 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
                     logger.warning(
                         f"[morning-bootstrap] Failed to cleanup previous cron job {existing_cron_job_id}: {cleanup_error}"
                     )
-
-            cron_job_id = await cron_service.create_one_time_job(
-                target_datetime=target_local,
-                event_id=event_id,
-                timezone=user_timezone,
-            )
-            await event_repo.update_event(
-                event_id,
-                scheduled_time=target_local,
-                payload={
-                    "reason": "daily_bootstrap",
-                    "seed_date": seed_date,
-                    "timezone": user_timezone,
-                    "schedule_owner": "system",
-                    "schedule_policy": "morning_bootstrap",
-                },
-                executed=False,
-                cron_job_id=cron_job_id,
-            )
             logger.info(
                 f"[morning-bootstrap] Upserted cron for morning event user={user_id}, "
                 f"event_id={event_id}, wake={target_local.isoformat()}, cron_job_id={cron_job_id}"

@@ -3,7 +3,7 @@ Reminder scheduling helpers for automated push notifications.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 from zoneinfo import ZoneInfo
@@ -30,15 +30,20 @@ def _coerce_event_start_time(
     event_start_time: datetime | str,
     tz_name: str,
 ) -> datetime:
+    """Convert event_start_time to a datetime in the target timezone.
+
+    Naive datetimes (no tzinfo) are assumed to be UTC and converted to the
+    target timezone. Timezone-aware datetimes are converted via astimezone().
+    """
     tz = ZoneInfo(tz_name)
     if isinstance(event_start_time, datetime):
         if event_start_time.tzinfo is None:
-            return event_start_time.replace(tzinfo=tz)
+            return event_start_time.replace(tzinfo=timezone.utc).astimezone(tz)
         return event_start_time.astimezone(tz)
 
     parsed = datetime.fromisoformat(event_start_time.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=tz)
+        return parsed.replace(tzinfo=timezone.utc).astimezone(tz)
     return parsed.astimezone(tz)
 
 
@@ -101,6 +106,35 @@ async def schedule_calendar_reminder(
     if primary:
         reminder_event_id = str(primary["id"])
         previous_cron_job_id = primary.get("cron_job_id")
+
+        # Create-first: ensure event always has a cron job; delete old only after successful update
+        cron_job_id = await cron_service.create_one_time_job(
+            target_datetime=reminder_at,
+            event_id=reminder_event_id,
+            timezone=timezone_name,
+        )
+        try:
+            await event_repo.update_event(
+                reminder_event_id,
+                scheduled_time=reminder_at,
+                payload=payload,
+                executed=False,
+                cron_job_id=cron_job_id,
+                last_error=None,
+                last_attempt_at=None,
+            )
+        except Exception as update_error:
+            # Rollback: delete newly created orphan to avoid dangling cron job
+            try:
+                await cron_service.delete_job(cron_job_id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[reminder] Failed to cleanup orphan cron job %s after update failed: %s",
+                    cron_job_id,
+                    cleanup_error,
+                )
+            raise update_error
+
         if previous_cron_job_id:
             try:
                 await cron_service.delete_job(previous_cron_job_id)
@@ -110,21 +144,6 @@ async def schedule_calendar_reminder(
                     previous_cron_job_id,
                     cleanup_error,
                 )
-
-        cron_job_id = await cron_service.create_one_time_job(
-            target_datetime=reminder_at,
-            event_id=reminder_event_id,
-            timezone=timezone_name,
-        )
-        await event_repo.update_event(
-            reminder_event_id,
-            scheduled_time=reminder_at,
-            payload=payload,
-            executed=False,
-            cron_job_id=cron_job_id,
-            last_error=None,
-            last_attempt_at=None,
-        )
     else:
         created = await event_repo.create_event(
             user_id=user_id,
@@ -133,12 +152,23 @@ async def schedule_calendar_reminder(
             payload=payload,
         )
         reminder_event_id = str(created["id"])
-        cron_job_id = await cron_service.create_one_time_job(
-            target_datetime=reminder_at,
-            event_id=reminder_event_id,
-            timezone=timezone_name,
-        )
-        await event_repo.update_cron_job_id(reminder_event_id, cron_job_id)
+        try:
+            cron_job_id = await cron_service.create_one_time_job(
+                target_datetime=reminder_at,
+                event_id=reminder_event_id,
+                timezone=timezone_name,
+            )
+            await event_repo.update_cron_job_id(reminder_event_id, cron_job_id)
+        except Exception as e:
+            try:
+                await event_repo.delete_event(reminder_event_id)
+            except Exception as cleanup_err:
+                logger.warning(
+                    "[reminder] Failed to cleanup orphaned event %s after cron error: %s",
+                    reminder_event_id,
+                    cleanup_err,
+                )
+            raise
 
     logger.info(
         "[reminder] Scheduled user=%s calendar_event_id=%s event_id=%s at=%s immediate=%s",

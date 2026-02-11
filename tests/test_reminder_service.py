@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock
 
 import pytest
-
+import time_machine
 import reminder_service
 
 
@@ -83,6 +83,7 @@ async def test_schedule_calendar_reminder_uses_immediate_window(monkeypatch):
 
 
 @pytest.mark.asyncio
+@time_machine.travel("2024-01-15T12:00:00+00:00", tick=False)
 async def test_schedule_calendar_reminder_overwrites_existing(monkeypatch):
     monkeypatch.setenv("ENABLE_AUTOMATED_EVENT_REMINDERS", "true")
     existing = {

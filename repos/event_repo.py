@@ -61,6 +61,14 @@ async def create_event(
     return dict(row)
 
 
+async def delete_event(event_id: str) -> bool:
+    """Delete an event by ID. Returns True if a row was deleted."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM events WHERE id = $1", event_id)
+    return result.endswith("1")
+
+
 async def update_cron_job_id(event_id: str, cron_job_id: int) -> bool:
     """Update the cron_job_id for an event after creating the cron job."""
     pool = await get_pool()

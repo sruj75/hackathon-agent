@@ -3,6 +3,7 @@ Async Postgres client for Supabase-backed persistence.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -12,6 +13,7 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
+_pool_init_lock = asyncio.Lock()
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -20,20 +22,24 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is not None:
         return _pool
 
-    db_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
-    if not db_url:
-        raise ValueError(
-            "Missing database URL. Set SUPABASE_DB_URL (or DATABASE_URL)."
-        )
+    async with _pool_init_lock:
+        if _pool is not None:
+            return _pool
 
-    _pool = await asyncpg.create_pool(
-        dsn=db_url,
-        min_size=1,
-        max_size=10,
-        command_timeout=30,
-    )
-    logger.info("Supabase Postgres pool initialized")
-    return _pool
+        db_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+        if not db_url:
+            raise ValueError(
+                "Missing database URL. Set SUPABASE_DB_URL (or DATABASE_URL)."
+            )
+
+        _pool = await asyncpg.create_pool(
+            dsn=db_url,
+            min_size=1,
+            max_size=10,
+            command_timeout=30,
+        )
+        logger.info("Supabase Postgres pool initialized")
+        return _pool
 
 
 async def close_pool() -> None:

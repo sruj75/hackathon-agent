@@ -57,9 +57,22 @@ async def _get_jwks_by_kid(kid: str) -> dict[str, Any]:
         return cached_keys[kid]
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(_jwks_url())
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = await client.get(_jwks_url())
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            logger.error("JWKS fetch failed with status %s", exc.response.status_code)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unable to verify token",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error("JWKS fetch request failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unable to verify token",
+            ) from exc
 
     keys_by_kid: dict[str, Any] = {}
     for key in payload.get("keys", []):
@@ -109,7 +122,14 @@ async def verify_supabase_jwt(access_token: str) -> AuthUser:
         )
 
     jwk = await _get_jwks_by_kid(kid)
-    key = algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+    try:
+        key = algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+    except (jwt_exceptions.InvalidKeyError, ValueError) as exc:
+        logger.warning("Invalid JWK: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token signing key",
+        ) from exc
 
     try:
         claims = jwt.decode(

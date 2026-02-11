@@ -18,3 +18,5 @@ class TestAgentRuntime:
         alias = AgentRuntime.get_conversation_mode_config()
         assert alias.response_modalities == primary.response_modalities
         assert alias.streaming_mode == primary.streaming_mode
+        assert alias.input_audio_transcription == primary.input_audio_transcription
+        assert alias.output_audio_transcription == primary.output_audio_transcription
