@@ -14,7 +14,29 @@ logger = logging.getLogger(__name__)
 
 CRONJOB_API_URL = "https://api.cron-job.org"
 CRONJOB_API_KEY = os.getenv("CRONJOB_ORG_API_KEY")
+_CRONJOB_API_KEY_MISSING_AT_IMPORT = CRONJOB_API_KEY is None
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
+_BACKEND_URL_DEFAULT_AT_IMPORT = (
+    BACKEND_URL == "http://localhost:8080" and "BACKEND_URL" not in os.environ
+)
+
+
+def _get_runtime_api_key() -> str | None:
+    """Resolve API key at call time to support late-loaded env vars."""
+    # If the key existed at import time, treat the module constant as authoritative
+    # so tests can reliably patch it.
+    if CRONJOB_API_KEY is not None or not _CRONJOB_API_KEY_MISSING_AT_IMPORT:
+        return CRONJOB_API_KEY
+    return os.getenv("CRONJOB_ORG_API_KEY")
+
+
+def _get_runtime_backend_url() -> str:
+    """Resolve backend URL at call time to support late-loaded env vars."""
+    if BACKEND_URL != "http://localhost:8080":
+        return BACKEND_URL.rstrip("/")
+    if _BACKEND_URL_DEFAULT_AT_IMPORT:
+        return os.getenv("BACKEND_URL", BACKEND_URL).rstrip("/")
+    return BACKEND_URL.rstrip("/")
 
 
 async def create_one_time_job(
@@ -36,7 +58,8 @@ async def create_one_time_job(
     Raises:
         Exception: If the API request fails
     """
-    if not CRONJOB_API_KEY:
+    api_key = _get_runtime_api_key()
+    if not api_key:
         raise ValueError("CRONJOB_ORG_API_KEY environment variable not set")
     if not isinstance(timezone, str) or not timezone.strip():
         raise ValueError("missing_timezone")
@@ -46,7 +69,7 @@ async def create_one_time_job(
     expires_at_formatted = int(expires_at.strftime("%Y%m%d%H%M%S"))
     
     # Build callback URL
-    callback_url = f"{BACKEND_URL}/api/execute-event/{event_id}"
+    callback_url = f"{_get_runtime_backend_url()}/api/execute-event/{event_id}"
     
     # Prepare job payload
     payload = {
@@ -70,7 +93,7 @@ async def create_one_time_job(
     }
     
     headers = {
-        "Authorization": f"Bearer {CRONJOB_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     
@@ -158,7 +181,8 @@ async def delete_job(job_id: int) -> bool:
     Returns:
         bool: True if deletion succeeded, False otherwise
     """
-    if not CRONJOB_API_KEY:
+    api_key = _get_runtime_api_key()
+    if not api_key:
         logger.warning("CRONJOB_ORG_API_KEY not set, skipping job deletion")
         return False
     
@@ -167,7 +191,7 @@ async def delete_job(job_id: int) -> bool:
         return False
     
     headers = {
-        "Authorization": f"Bearer {CRONJOB_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     

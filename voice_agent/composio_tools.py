@@ -107,11 +107,13 @@ def today_in_user_timezone() -> str:
 
 
 def local_day_bounds(date_str: str, tz_name: str) -> tuple[datetime, datetime]:
-    """Build start/end datetimes for a local calendar day."""
+    """Build start/end datetimes for a local calendar day (end is exclusive)."""
     tz = ZoneInfo(tz_name)
     start = datetime.fromisoformat(f"{date_str}T00:00:00").replace(tzinfo=tz)
-    end = start + timedelta(days=1) - timedelta(seconds=1)
-    return start, end
+    # Do not assume local days are always 24 hours (DST transitions).
+    next_day = (start + timedelta(days=1)).date().isoformat()
+    end_exclusive = datetime.fromisoformat(f"{next_day}T00:00:00").replace(tzinfo=tz)
+    return start, end_exclusive
 
 
 def _is_hhmm(value: str) -> bool:

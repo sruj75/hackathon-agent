@@ -23,7 +23,7 @@ def test_local_day_bounds_are_timezone_aware():
     assert start.tzinfo is not None
     assert end.tzinfo is not None
     assert start.isoformat().startswith("2026-02-11T00:00:00")
-    assert end.isoformat().startswith("2026-02-11T23:59:59")
+    assert end.isoformat().startswith("2026-02-12T00:00:00")
 
 
 def test_parse_user_datetime_converts_utc_to_user_timezone():
