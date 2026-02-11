@@ -7,7 +7,6 @@ import pytest
 from freezegun import freeze_time
 
 import cron_service
-from agent_runtime import AgentRuntime
 from repos import event_repo, session_repo
 from session_manager import ADKSessionManager
 
@@ -96,8 +95,8 @@ def in_memory_session_repo(monkeypatch):
     return sessions
 
 
-async def _fake_thinking_mode(user_id: str, trigger_context: str, session_manager, timezone=None):
-    """Minimal thinking-mode stub that still exercises session persistence."""
+async def _append_daily_checkpoint(user_id: str, trigger_context: str, session_manager):
+    """Append one checkpoint into the user's daily persisted session."""
     session_id = ADKSessionManager.get_daily_session_id(user_id)
     session = await session_manager.get_or_create_session(
         app_name="intentive-coach",
@@ -121,7 +120,6 @@ async def _fake_thinking_mode(user_id: str, trigger_context: str, session_manage
         state=session.state,
         user_id=user_id,
     )
-    yield MagicMock()
 
 
 @pytest.mark.integration
@@ -157,19 +155,17 @@ class TestMorningWakeFlow:
         updated = await event_repo.update_cron_job_id(event["id"], cron_job_id)
         assert updated is True
 
-        monkeypatch.setattr(AgentRuntime, "run_thinking_mode", _fake_thinking_mode)
         session_manager = MagicMock()
         session_manager.get_or_create_session = AsyncMock(
             return_value=MagicMock(state={})
         )
         session_manager.save_agent_session_to_db = AsyncMock(return_value=True)
 
-        async for _ in AgentRuntime.run_thinking_mode(
+        await _append_daily_checkpoint(
             user_id=user_id,
             trigger_context="Morning wake: 8:00 AM",
             session_manager=session_manager,
-        ):
-            pass
+        )
 
         before_execution = await event_repo.get_by_id(event["id"])
         assert before_execution["executed"] is False
@@ -213,19 +209,17 @@ class TestCheckinFlow:
         updated = await event_repo.update_cron_job_id(event["id"], cron_job_id)
         assert updated is True
 
-        monkeypatch.setattr(AgentRuntime, "run_thinking_mode", _fake_thinking_mode)
         session_manager = MagicMock()
         session_manager.get_or_create_session = AsyncMock(
             return_value=MagicMock(state={})
         )
         session_manager.save_agent_session_to_db = AsyncMock(return_value=True)
 
-        async for _ in AgentRuntime.run_thinking_mode(
+        await _append_daily_checkpoint(
             user_id=user_id,
             trigger_context="Check-in: deep work ended",
             session_manager=session_manager,
-        ):
-            pass
+        )
 
         await event_repo.mark_executed(event["id"])
 
@@ -300,35 +294,30 @@ class TestSessionContinuity:
     ):
         user_id = "test_user"
 
-        monkeypatch.setattr(AgentRuntime, "run_thinking_mode", _fake_thinking_mode)
-
         with freeze_time("2026-02-04"):
             manager = ADKSessionManager()
             session_id = ADKSessionManager.get_daily_session_id(user_id)
 
             with freeze_time("2026-02-04 08:00:00"):
-                async for _ in AgentRuntime.run_thinking_mode(
+                await _append_daily_checkpoint(
                     user_id=user_id,
                     trigger_context="Morning wake",
                     session_manager=manager,
-                ):
-                    pass
+                )
 
             with freeze_time("2026-02-04 11:00:00"):
-                async for _ in AgentRuntime.run_thinking_mode(
+                await _append_daily_checkpoint(
                     user_id=user_id,
                     trigger_context="Check-in: deep work ended",
                     session_manager=manager,
-                ):
-                    pass
+                )
 
             with freeze_time("2026-02-04 14:00:00"):
-                async for _ in AgentRuntime.run_thinking_mode(
+                await _append_daily_checkpoint(
                     user_id=user_id,
                     trigger_context="Check-in: lunch ended",
                     session_manager=manager,
-                ):
-                    pass
+                )
 
         db_session = await session_repo.get_session(session_id)
         assert db_session is not None
@@ -349,8 +338,6 @@ class TestFullDayCycle:
         in_memory_session_repo,
     ):
         user_id = "test_user"
-
-        monkeypatch.setattr(AgentRuntime, "run_thinking_mode", _fake_thinking_mode)
 
         with freeze_time("2026-02-04"):
             manager = ADKSessionManager()
@@ -378,12 +365,11 @@ class TestFullDayCycle:
                     )
                     created_events.append(event)
 
-                    async for _ in AgentRuntime.run_thinking_mode(
+                    await _append_daily_checkpoint(
                         user_id=user_id,
                         trigger_context=trigger_context,
                         session_manager=manager,
-                    ):
-                        pass
+                    )
 
                     await event_repo.mark_executed(event["id"])
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
-from typing import List, Optional
+from typing import List, Optional, Sequence
 import uuid
 
 from db import get_pool
@@ -187,3 +187,75 @@ async def list_future_unexecuted_events_missing_cron(limit: int = 200) -> List[d
             limit,
         )
     return [dict(row) for row in rows]
+
+
+async def find_pending_calendar_reminder(
+    user_id: str,
+    calendar_event_id: str,
+) -> Optional[dict]:
+    """Find the earliest pending reminder for a calendar event."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM events
+            WHERE user_id = $1
+              AND event_type = 'calendar_reminder'
+              AND executed = FALSE
+              AND payload->>'calendar_event_id' = $2
+            ORDER BY scheduled_time ASC
+            LIMIT 1
+            """,
+            user_id,
+            calendar_event_id,
+        )
+    return dict(row) if row else None
+
+
+async def list_pending_by_calendar_event(
+    user_id: str,
+    calendar_event_id: str,
+) -> List[dict]:
+    """List all pending reminder rows for a calendar event."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *
+            FROM events
+            WHERE user_id = $1
+              AND event_type = 'calendar_reminder'
+              AND executed = FALSE
+              AND payload->>'calendar_event_id' = $2
+            ORDER BY scheduled_time ASC
+            """,
+            user_id,
+            calendar_event_id,
+        )
+    return [dict(row) for row in rows]
+
+
+async def mark_cancelled(event_ids: Sequence[str], reason: str = "cancelled") -> int:
+    """Mark reminder rows as executed/cancelled."""
+    if not event_ids:
+        return 0
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE events
+            SET executed = TRUE, last_error = $2, updated_at = $3
+            WHERE id = ANY($1::text[])
+              AND executed = FALSE
+            """,
+            list(event_ids),
+            reason,
+            _utcnow(),
+        )
+    try:
+        return int(result.split()[-1])
+    except Exception:
+        logger.warning("Unexpected mark_cancelled result format: %s", result)
+        return 0

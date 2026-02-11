@@ -2,6 +2,7 @@
 Composio tools for Google Calendar and Tasks.
 Scrappy implementation - no fancy abstractions.
 """
+import asyncio
 import os
 from dotenv import load_dotenv
 from composio import Composio, Action
@@ -11,6 +12,11 @@ import pytz
 from zoneinfo import ZoneInfo
 
 from context import current_user_id, current_user_timezone
+from reminder_service import (
+    cancel_calendar_reminders,
+    reminders_enabled,
+    schedule_calendar_reminder,
+)
 
 # Ensure .env is loaded regardless of import order (safe to call multiple times)
 load_dotenv()
@@ -81,6 +87,28 @@ def _get_user_timezone() -> str:
         return cached_timezone
 
     raise ValueError("missing_timezone")
+
+
+def _run_async_task(coro, *, label: str) -> None:
+    """Run coroutine from sync tool code in-loop or in a temporary loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(coro)
+        except Exception as exc:
+            logger.warning("[REMINDER] %s failed: %s", label, exc)
+        return
+
+    task = loop.create_task(coro)
+
+    def _done_callback(done_task):
+        try:
+            done_task.result()
+        except Exception as exc:
+            logger.warning("[REMINDER] %s failed: %s", label, exc)
+
+    task.add_done_callback(_done_callback)
 
 
 # ========================================
@@ -680,6 +708,33 @@ def timeblock_task(task_title: str, start_time: str, duration_minutes: int = 60,
             logger.warning(f"Failed to update task notes with event link: {e}")
             # Event created but linking failed - not critical
         
+        try:
+            tool_user_id = current_user_id.get()
+        except LookupError:
+            tool_user_id = None
+
+        if reminders_enabled() and tool_user_id and event_id:
+            try:
+                user_timezone = _get_user_timezone()
+                _run_async_task(
+                    schedule_calendar_reminder(
+                        user_id=tool_user_id,
+                        calendar_event_id=event_id,
+                        event_title=event_result["data"]["event"]["title"],
+                        event_start_time=event_result["data"]["event"]["start_time"],
+                        timezone_name=user_timezone,
+                        lead_minutes=5,
+                        source="agent_timeblock",
+                    ),
+                    label=f"schedule reminder calendar_event_id={event_id}",
+                )
+            except Exception as reminder_error:
+                logger.warning(
+                    "[REMINDER] Failed to enqueue reminder for event %s: %s",
+                    event_id,
+                    reminder_error,
+                )
+
         return {
             "success": True,
             "data": {
@@ -1287,6 +1342,19 @@ def delete_task(task_title: str) -> dict:
                 )
                 removed_event = True
                 logger.info(f"Deleted linked calendar event {event_id} for task '{task_title}'")
+                try:
+                    tool_user_id = current_user_id.get()
+                except LookupError:
+                    tool_user_id = None
+                if reminders_enabled() and tool_user_id:
+                    _run_async_task(
+                        cancel_calendar_reminders(
+                            user_id=tool_user_id,
+                            calendar_event_id=event_id,
+                            reason="calendar_event_deleted",
+                        ),
+                        label=f"cancel reminders calendar_event_id={event_id}",
+                    )
             except Exception as e:
                 logger.warning(f"Failed to delete linked event {event_id}: {e}")
                 # Task is deleted, event deletion failure is not critical

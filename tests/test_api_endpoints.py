@@ -1,6 +1,6 @@
 """API endpoint tests for current backend."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -73,6 +73,7 @@ async def test_save_token_rejects_invalid_payload(api_client):
 
 @pytest.mark.asyncio
 async def test_execute_event_not_found(api_client, monkeypatch):
+    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     monkeypatch.setattr(main.event_repo, "get_by_id", AsyncMock(return_value=None))
 
     response = await api_client.post("/api/execute-event/event_missing")
@@ -83,6 +84,7 @@ async def test_execute_event_not_found(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_event_already_executed(api_client, monkeypatch):
+    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     monkeypatch.setattr(
         main.event_repo,
         "get_by_id",
@@ -96,88 +98,114 @@ async def test_execute_event_already_executed(api_client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_execute_event_requires_secret_when_configured(api_client, monkeypatch):
+    monkeypatch.setenv("EXECUTE_EVENT_SECRET", "shh")
+    monkeypatch.setattr(
+        main.event_repo,
+        "get_by_id",
+        AsyncMock(
+            return_value={
+                "id": "event_123",
+                "executed": False,
+                "user_id": "user_test",
+                "event_type": "checkin",
+                "payload": {},
+                "cron_job_id": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(main.event_repo, "update_event", AsyncMock(return_value=True))
+    monkeypatch.setattr(main, "send_push_notification", AsyncMock(return_value=True))
+    monkeypatch.setattr(main.cron_service, "delete_job", AsyncMock(return_value=True))
+
+    unauthorized = await api_client.post("/api/execute-event/event_123")
+    assert unauthorized.status_code == 401
+
+    authorized = await api_client.post("/api/execute-event/event_123?secret=shh")
+    assert authorized.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
+    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     event = {
         "id": "event_123",
         "user_id": "user_test",
         "event_type": "checkin",
-        "payload": {"reason": "deep_work", "timezone": "UTC"},
+        "payload": {"reason": "deep_work"},
         "executed": False,
         "cron_job_id": 98765,
     }
 
     get_event_mock = AsyncMock(return_value=event)
-    mark_executed_mock = AsyncMock(return_value=None)
+    update_event_mock = AsyncMock(return_value=True)
     delete_job_mock = AsyncMock(return_value=True)
-
-    async def fake_thinking_mode(**kwargs):
-        _ = kwargs
-        yield MagicMock()
+    send_push_mock = AsyncMock(return_value=True)
 
     monkeypatch.setattr(main.event_repo, "get_by_id", get_event_mock)
-    monkeypatch.setattr(main.event_repo, "mark_executed", mark_executed_mock)
+    monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
     monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
-    monkeypatch.setattr(main.AgentRuntime, "run_thinking_mode", fake_thinking_mode)
+    monkeypatch.setattr(main, "send_push_notification", send_push_mock)
 
     response = await api_client.post("/api/execute-event/event_123")
 
     assert response.status_code == 200
-    assert response.json()["status"] == "executed"
-    mark_executed_mock.assert_awaited_once_with("event_123")
+    body = response.json()
+    assert body["status"] == "executed"
+    assert body["push_sent"] is True
+    update_event_mock.assert_awaited_once()
+    update_kwargs = update_event_mock.await_args.kwargs
+    assert update_kwargs["executed"] is True
+    assert update_kwargs["last_error"] is None
     delete_job_mock.assert_awaited_once_with(98765)
+    send_push_mock.assert_awaited_once()
+    push_args = send_push_mock.await_args.args
+    assert push_args[0] == "user_test"
+    assert push_args[1] == "Check-in"
+    assert push_args[3]["session_id"].startswith("session_user_test_")
+    assert push_args[3]["type"] == "checkin"
 
 
 @pytest.mark.asyncio
-async def test_execute_event_failure_schedules_retry(api_client, monkeypatch):
+async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
+    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     event = {
         "id": "event_retry",
         "user_id": "user_test",
-        "event_type": "checkin",
-        "payload": {"reason": "deep_work", "timezone": "UTC", "retry_count": 0},
+        "event_type": "calendar_reminder",
+        "payload": {
+            "event_title": "Standup",
+            "event_start_time": "2099-01-01T09:00:00+00:00",
+            "timezone": "UTC",
+            "calendar_event_id": "gcal_99",
+        },
         "executed": False,
         "cron_job_id": 11111,
     }
-    monkeypatch.setenv("EXECUTE_EVENT_RETRY_DELAY_MINUTES", "1")
-    monkeypatch.setenv("EXECUTE_EVENT_MAX_RETRIES", "2")
 
     get_event_mock = AsyncMock(return_value=event)
-    mark_executed_mock = AsyncMock(return_value=None)
     update_event_mock = AsyncMock(return_value=True)
-    create_retry_cron_mock = AsyncMock(return_value=22222)
     delete_job_mock = AsyncMock(return_value=True)
-
-    async def failing_thinking_mode(**kwargs):
-        _ = kwargs
-        raise Exception("temporary model failure")
-        if False:  # pragma: no cover
-            yield MagicMock()
+    send_push_mock = AsyncMock(return_value=False)
 
     monkeypatch.setattr(main.event_repo, "get_by_id", get_event_mock)
-    monkeypatch.setattr(main.event_repo, "mark_executed", mark_executed_mock)
     monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
-    monkeypatch.setattr(
-        main.cron_service, "create_one_time_job", create_retry_cron_mock
-    )
     monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
-    monkeypatch.setattr(main.AgentRuntime, "run_thinking_mode", failing_thinking_mode)
+    monkeypatch.setattr(main, "send_push_notification", send_push_mock)
 
     response = await api_client.post("/api/execute-event/event_retry")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "retry_scheduled"
-    assert body["retry_count"] == 1
+    assert body["status"] == "executed"
+    assert body["push_sent"] is False
 
-    mark_executed_mock.assert_not_awaited()
-    delete_job_mock.assert_not_awaited()
-    create_retry_cron_mock.assert_awaited_once()
-
-    assert update_event_mock.await_count == 1
+    update_event_mock.assert_awaited_once()
     update_args = update_event_mock.await_args
     assert update_args.args[0] == "event_retry"
-    assert update_args.kwargs["executed"] is False
-    assert update_args.kwargs["cron_job_id"] == 22222
-    assert update_args.kwargs["payload"]["retry_count"] == 1
+    assert update_args.kwargs["executed"] is True
+    assert update_args.kwargs["last_error"] == "push_failed_or_missing_token"
+    delete_job_mock.assert_awaited_once_with(11111)
 
 
 @pytest.mark.asyncio

@@ -198,6 +198,40 @@ class TestNotificationService:
             assert payload['priority'] == "high"
 
     @pytest.mark.asyncio
+    async def test_payload_supports_resume_and_reminder_fields(self, mock_user_repo):
+        """Reminder pushes preserve deep-link context fields."""
+        mock_user_repo.get_push_token = AsyncMock(return_value="ExponentPushToken[test123]")
+
+        with patch('notification_service.httpx.AsyncClient') as mock_client_class:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"data": [{"status": "ok"}]}
+
+            mock_post = AsyncMock(return_value=mock_response)
+            mock_client_instance = MagicMock()
+            mock_client_instance.post = mock_post
+            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+            mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client_instance
+
+            await send_push_notification(
+                user_id="user_default",
+                title="Upcoming: Standup",
+                body="Standup starts at 09:00 AM.",
+                data={
+                    "session_id": "session_user_default_2026-02-11",
+                    "type": "calendar_reminder",
+                    "trigger_type": "calendar_reminder",
+                    "calendar_event_id": "gcal_123",
+                },
+            )
+
+            payload = mock_post.call_args.kwargs["json"]
+            assert payload["data"]["session_id"] == "session_user_default_2026-02-11"
+            assert payload["data"]["trigger_type"] == "calendar_reminder"
+            assert payload["data"]["calendar_event_id"] == "gcal_123"
+
+    @pytest.mark.asyncio
     async def test_delete_push_token(self, mock_user_repo):
         """Test token deletion delegates to user_repo."""
         mock_user_repo.delete_push_token = AsyncMock(return_value=None)

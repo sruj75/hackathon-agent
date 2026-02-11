@@ -82,11 +82,10 @@ async def test_phase2_event_cron_link_lifecycle(monkeypatch):
 def test_phase2_agent_runtime_interface_contract():
     from agent_runtime import AgentRuntime
 
-    sig = inspect.signature(AgentRuntime.run_thinking_mode)
-    params = list(sig.parameters.keys())
-    assert "user_id" in params
-    assert "trigger_context" in params
-    assert "session_manager" in params
+    assert not hasattr(AgentRuntime, "run_thinking_mode")
 
-    config = AgentRuntime.get_conversation_mode_config()
+    sig = inspect.signature(AgentRuntime.get_realtime_run_config)
+    assert len(sig.parameters) == 0
+
+    config = AgentRuntime.get_realtime_run_config()
     assert config.response_modalities == ["AUDIO"]

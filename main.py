@@ -11,13 +11,15 @@ import logging
 import os
 import re
 import warnings
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from composio import Composio
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables BEFORE importing agent
@@ -31,21 +33,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 from voice_agent.agent import (  # noqa: E402
     conversation_agent as agent,
 )
-from voice_agent.render_ui_tools import set_ui_event_queue, get_ui_event_queue  # noqa: E402
+from voice_agent.render_ui_tools import set_ui_event_queue  # noqa: E402
 
 from google.adk.runners import Runner
 from session_manager import ADKSessionManager
-from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.genai import types
 from context import current_session_id, current_user_id, current_user_timezone
 
 from auth import AuthUser, get_authenticated_user, verify_supabase_jwt
 from repos import event_repo, user_repo
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, timedelta, timezone
 from agent_runtime import AgentRuntime
 import cron_service
 from db import close_pool
+from notification_service import send_push_notification
+from reminder_service import reminders_enabled
 
 # Configure logging
 logging.basicConfig(
@@ -64,6 +67,28 @@ def _event_field(event: object, field: str, default=None):
         return event.get(field, default)
     return getattr(event, field, default)
 
+
+def _env_flag_enabled(name: str, default: str) -> bool:
+    """Parse common boolean env flags."""
+    return os.getenv(name, default).lower() in ("1", "true", "yes")
+
+
+@dataclass(frozen=True)
+class LifecycleSettings:
+    enable_reliability_bootstrap: bool
+    enable_morning_cron_reconcile: bool
+
+
+def _read_lifecycle_settings() -> LifecycleSettings:
+    return LifecycleSettings(
+        enable_reliability_bootstrap=_env_flag_enabled(
+            "ENABLE_RELIABILITY_BOOTSTRAP", "true"
+        ),
+        enable_morning_cron_reconcile=_env_flag_enabled(
+            "ENABLE_MORNING_CRON_RECONCILE", "false"
+        ),
+    )
+
 # Suppress Pydantic serialization warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
@@ -74,10 +99,20 @@ APP_NAME = "intentive-coach"
 # FastAPI App Setup
 # ========================================
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await lifecycle_manager.startup()
+    app.state.lifecycle = lifecycle_manager
+    try:
+        yield
+    finally:
+        await lifecycle_manager.shutdown()
+
 app = FastAPI(
     title="Intentive Voice Agent API",
     description="Real-time voice AI coaching with Gemini Live API",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS middleware for frontend access
@@ -648,8 +683,32 @@ async def get_composio_status(current_user: AuthUser = Depends(get_authenticated
 # ========================================
 
 
+def _require_execute_event_secret(secret: str | None = Query(default=None)) -> None:
+    expected_secret = os.getenv("EXECUTE_EVENT_SECRET")
+    if expected_secret and secret != expected_secret:
+        raise HTTPException(status_code=401, detail="Invalid event secret")
+
+
+def _format_calendar_reminder_body(payload: dict) -> str:
+    event_title = str(payload.get("event_title") or "upcoming event")
+    start_raw = payload.get("event_start_time")
+    timezone_name = _normalize_timezone(payload.get("timezone")) or "UTC"
+    try:
+        if isinstance(start_raw, str):
+            start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+            if start_dt.tzinfo:
+                start_dt = start_dt.astimezone(ZoneInfo(timezone_name))
+            return f"{event_title} starts at {start_dt.strftime('%I:%M %p')}."
+    except Exception:
+        pass
+    return f"{event_title} starts soon."
+
+
 @app.post("/api/execute-event/{event_id}")
-async def execute_event(event_id: str):
+async def execute_event(
+    event_id: str,
+    _: None = Depends(_require_execute_event_secret),
+):
     """
     Execute a specific scheduled event.
     Called by cron-jobs.org at the scheduled time.
@@ -667,140 +726,59 @@ async def execute_event(event_id: str):
         logger.info(f"Event {event_id} already executed, skipping")
         return {"status": "already_executed"}
     
-    # Agent Logic (Hybrid Architecture)
-    # UNIFIED ARCHITECTURE: Thinking Mode (Standard API) via AgentRuntime
-    
-# ========================================
-# Agent Logic: Thinking Mode (Text)
-# ========================================
-    
-    # 1. Trigger Prompt (minimal but event-aware)
-    event_type = _event_field(event, "event_type", "checkin")
-    payload = _event_field(event, "payload", {}) or {}
-    reason = payload.get("reason")
-    event_timezone = _normalize_timezone(payload.get("timezone"))
-    if not event_timezone:
-        try:
-            profile = await user_repo.get_profile(_event_field(event, "user_id", ""))
-        except Exception as profile_error:
-            logger.warning(
-                f"[execute-event] Failed to load profile timezone for {_event_field(event, 'user_id', '')}: {profile_error}"
-            )
-            profile = None
-        event_timezone = _normalize_timezone((profile or {}).get("timezone"))
-    if not event_timezone:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "status": "missing_timezone",
-                "event_id": event_id,
-                "message": "Cannot execute scheduled event without user timezone.",
-            },
-        )
-
-    if event_type == "morning_wake":
-        trigger_prompt = "You just woke up."
-    else:
-        trigger_prompt = (
-            f"A scheduled check-in timer fired. reason={reason or 'unspecified'}"
-        )
-    
-    # 2. Run Turn via AgentRuntime
+    event_type = str(_event_field(event, "event_type", "checkin"))
     event_user_id = _event_field(event, "user_id")
     if not event_user_id:
         raise HTTPException(status_code=500, detail="Event missing user_id")
 
-    logger.info(f"--- Calling AgentRuntime.run_thinking_mode for user {event_user_id} ---")
-    try:
-        async for agent_event in AgentRuntime.run_thinking_mode(
-            user_id=event_user_id,
-            trigger_context=trigger_prompt,
-            session_manager=session_manager,
-            timezone=event_timezone,
-        ):
-            # Log significant events
-            if hasattr(agent_event, "content") and agent_event.content and agent_event.content.parts:
-                for part in agent_event.content.parts:
-                    if hasattr(part, "function_call") and part.function_call:
-                         logger.info(f"🤖 [THINKING] Tool Call: {part.function_call.name}")
-                    if hasattr(part, "text") and part.text:
-                         logger.info(f"🤖 [THINKING] Agent response: {part.text}")
-        
-    except Exception as e:
-        logger.error(f"❌ [THINKING] Agent failed to run: {e}")
-        retry_delay_minutes = int(os.getenv("EXECUTE_EVENT_RETRY_DELAY_MINUTES", "2"))
-        max_retries = int(os.getenv("EXECUTE_EVENT_MAX_RETRIES", "2"))
-        now_utc = datetime.now(timezone.utc)
-        retry_count = 0
-        try:
-            retry_count = int(payload.get("retry_count", 0))
-        except Exception:
-            retry_count = 0
+    payload = _event_field(event, "payload", {}) or {}
+    reason = str(payload.get("reason") or "scheduled_checkin")
+    session_id = ADKSessionManager.get_daily_session_id(event_user_id)
+    trigger_type = str(payload.get("trigger_type") or event_type)
+    calendar_event_id = payload.get("calendar_event_id")
 
-        if retry_count >= max_retries:
-            await event_repo.update_event(
-                event_id,
-                executed=True,
-                last_error=str(e),
-                last_attempt_at=now_utc,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "status": "failed_permanently",
-                    "event_id": event_id,
-                    "retry_count": retry_count,
-                    "error": str(e),
-                },
-            )
+    title = "Check-in"
+    body = "You have a scheduled check-in."
+    if event_type == "morning_wake":
+        title = "Good morning"
+        body = "Ready to plan your day?"
+    elif event_type == "calendar_reminder":
+        title = f"Upcoming: {payload.get('event_title') or 'Event'}"
+        body = _format_calendar_reminder_body(payload)
+    elif event_type == "checkin":
+        title = "Check-in"
+        body = f"It is time for your check-in ({reason})."
 
-        retry_at = now_utc + timedelta(minutes=retry_delay_minutes)
-        next_retry_count = retry_count + 1
-        retry_payload = {
-            **payload,
-            "retry_count": next_retry_count,
-        }
+    notification_data = {
+        "session_id": session_id,
+        "type": event_type,
+        "trigger_type": trigger_type,
+        "event_id": event_id,
+        "user_id": event_user_id,
+    }
+    if isinstance(calendar_event_id, str) and calendar_event_id:
+        notification_data["calendar_event_id"] = calendar_event_id
 
-        try:
-            retry_cron_job_id = await cron_service.create_one_time_job(
-                target_datetime=retry_at,
-                event_id=event_id,
-                timezone=event_timezone,
-            )
-            await event_repo.update_event(
-                event_id,
-                scheduled_time=retry_at,
-                payload=retry_payload,
-                executed=False,
-                cron_job_id=retry_cron_job_id,
-                last_error=str(e),
-                last_attempt_at=now_utc,
-            )
-            return {
-                "status": "retry_scheduled",
-                "event_id": event_id,
-                "retry_count": next_retry_count,
-                "retry_at": retry_at.isoformat(),
-            }
-        except Exception as retry_error:
-            await event_repo.update_event(
-                event_id,
-                executed=False,
-                last_error=f"agent_error={e}; retry_error={retry_error}",
-                last_attempt_at=now_utc,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "status": "agent_failed",
-                    "event_id": event_id,
-                    "retry_scheduled": False,
-                    "error": str(e),
-                },
-            )
-    
-    # Mark event as executed
-    await event_repo.mark_executed(event_id)
+    logger.info(
+        "[execute-event] Dispatching push user=%s event_id=%s event_type=%s",
+        event_user_id,
+        event_id,
+        event_type,
+    )
+    push_sent = await send_push_notification(
+        event_user_id,
+        title,
+        body,
+        notification_data,
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    await event_repo.update_event(
+        event_id,
+        executed=True,
+        last_error=None if push_sent else "push_failed_or_missing_token",
+        last_attempt_at=now_utc,
+    )
     
     # Cleanup: Delete the cron job from cron-jobs.org
     event_cron_job_id = _event_field(event, "cron_job_id")
@@ -810,8 +788,13 @@ async def execute_event(event_id: str):
         except Exception as cleanup_error:
             logger.warning(f"Failed to cleanup cron job {event_cron_job_id}: {cleanup_error}")
             # Don't fail the request if cleanup fails
-    
-    return {"status": "executed", "agent_response": "processed"}
+
+    return {
+        "status": "executed",
+        "event_id": event_id,
+        "event_type": event_type,
+        "push_sent": push_sent,
+    }
 
 @app.post("/api/save-token")
 async def save_push_token(
@@ -837,52 +820,58 @@ async def save_push_token(
     return {"status": "saved", "user_id": user_id}
 
 
-@app.on_event("startup")
-async def reliability_bootstrap() -> None:
-    """
-    Reliability bootstrap:
-    1) Ensure each user has a pending next-morning wake event + cron
-    2) Optionally reconcile missing morning-bootstrap cron jobs only
-    """
-    if os.getenv("ENABLE_RELIABILITY_BOOTSTRAP", "true").lower() not in (
-        "1",
-        "true",
-        "yes",
-    ):
-        logger.info("[bootstrap] Reliability bootstrap disabled by env")
-        return
+class AppLifecycle:
+    """Minimal lifecycle orchestrator for startup/shutdown tasks."""
 
-    try:
-        users = await user_repo.get_all_users()
-        logger.info(f"[bootstrap] Seeding morning wake events for {len(users)} users")
-        for user in users:
-            try:
-                await _ensure_morning_wake_for_user(user)
-            except Exception as user_error:
-                logger.warning(
-                    f"[bootstrap] Failed to seed morning wake for user {(user or {}).get('user_id')}: {user_error}"
-                )
-    except Exception as e:
-        logger.warning(f"[bootstrap] Failed to seed morning wakes: {e}")
+    async def startup(self) -> None:
+        settings = _read_lifecycle_settings()
+        if not settings.enable_reliability_bootstrap:
+            logger.info("[bootstrap] Reliability bootstrap disabled by env")
+            return
 
-    if os.getenv("ENABLE_MORNING_CRON_RECONCILE", "false").lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
+        logger.info(
+            "[bootstrap] Automated event reminders enabled=%s",
+            reminders_enabled(),
+        )
+
         try:
-            await _reconcile_missing_cron_jobs()
+            users = await user_repo.get_all_users()
+            logger.info(f"[bootstrap] Seeding morning wake events for {len(users)} users")
+            for user in users:
+                try:
+                    await _ensure_morning_wake_for_user(user)
+                except Exception as user_error:
+                    logger.warning(
+                        f"[bootstrap] Failed to seed morning wake for user {(user or {}).get('user_id')}: {user_error}"
+                    )
         except Exception as e:
-            logger.warning(f"[bootstrap] Failed cron reconciliation: {e}")
+            logger.warning(f"[bootstrap] Failed to seed morning wakes: {e}")
+
+        if settings.enable_morning_cron_reconcile:
+            try:
+                await _reconcile_missing_cron_jobs()
+            except Exception as e:
+                logger.warning(f"[bootstrap] Failed cron reconciliation: {e}")
+
+    async def shutdown(self) -> None:
+        """Cleanup async resources."""
+        try:
+            await close_pool()
+        except Exception as e:
+            logger.warning(f"[shutdown] Failed to close DB pool: {e}")
 
 
-@app.on_event("shutdown")
+lifecycle_manager = AppLifecycle()
+
+
+async def reliability_bootstrap() -> None:
+    """Backward-compatible alias for startup bootstrap."""
+    await lifecycle_manager.startup()
+
+
 async def shutdown_cleanup() -> None:
-    """Cleanup async resources."""
-    try:
-        await close_pool()
-    except Exception as e:
-        logger.warning(f"[shutdown] Failed to close DB pool: {e}")
+    """Backward-compatible alias for shutdown cleanup."""
+    await lifecycle_manager.shutdown()
 
 
 @app.websocket("/ws/{session_id}")
@@ -898,7 +887,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     live_request_queue = LiveRequestQueue()
     ui_event_queue = asyncio.Queue()
     set_ui_event_queue(ui_event_queue)
-    run_config = AgentRuntime.get_conversation_mode_config()
+    run_config = AgentRuntime.get_realtime_run_config()
 
     try:
         first_message = await asyncio.wait_for(websocket.receive(), timeout=20.0)
@@ -1159,23 +1148,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         set_ui_event_queue(None)
 
         if session is not None and user_id:
-            logger.info("🧠 [POST-CONVERSATION] Triggering thinking mode after conversation ended")
-            try:
-                trigger_context = "Conversation just ended."
-                async for _ in AgentRuntime.run_thinking_mode(
-                    user_id=user_id,
-                    trigger_context=trigger_context,
-                    session_manager=session_manager,
-                    timezone=_normalize_timezone(session.state.get("user_timezone")),
-                ):
-                    pass
-                logger.info("✅ [POST-CONVERSATION] Thinking turn completed successfully")
-            except Exception as thinking_error:
-                logger.error(
-                    "❌ [POST-CONVERSATION] Failed to run thinking turn: %s",
-                    thinking_error,
-                    exc_info=True,
-                )
+            logger.info("[POST-CONVERSATION] Session closed for user=%s", user_id)
 
 
 # ========================================

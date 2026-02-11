@@ -15,7 +15,6 @@ from httpx import ASGITransport, AsyncClient
 import main
 from auth import AuthUser, get_authenticated_user
 from session_manager import ADKSessionManager
-from voice_agent import set_timer as set_timer_module
 
 
 async def _fake_auth_user():
@@ -92,11 +91,6 @@ class _FakeWebSocket:
         self.sent_texts.append(text)
 
 
-async def _empty_thinking_mode(*_args, **_kwargs):
-    if False:  # pragma: no cover - keeps this as an async generator
-        yield None
-
-
 @pytest.mark.regression
 class TestPhase6WebSocketFlow:
     def test_select_ws_session_id_uses_requested_when_valid(self):
@@ -129,13 +123,8 @@ class TestPhase6WebSocketFlow:
         monkeypatch.setattr(main.types, "Blob", _FakeBlob)
         monkeypatch.setattr(
             main.AgentRuntime,
-            "get_conversation_mode_config",
+            "get_realtime_run_config",
             staticmethod(lambda: object()),
-        )
-        monkeypatch.setattr(
-            main.AgentRuntime,
-            "run_thinking_mode",
-            staticmethod(_empty_thinking_mode),
         )
         monkeypatch.setattr(
             main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -201,13 +190,8 @@ class TestPhase6WebSocketFlow:
         monkeypatch.setattr(main.types, "Blob", _FakeBlob)
         monkeypatch.setattr(
             main.AgentRuntime,
-            "get_conversation_mode_config",
+            "get_realtime_run_config",
             staticmethod(lambda: object()),
-        )
-        monkeypatch.setattr(
-            main.AgentRuntime,
-            "run_thinking_mode",
-            staticmethod(_empty_thinking_mode),
         )
         monkeypatch.setattr(
             main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -264,13 +248,8 @@ class TestPhase6WebSocketFlow:
         monkeypatch.setattr(main.types, "Blob", _FakeBlob)
         monkeypatch.setattr(
             main.AgentRuntime,
-            "get_conversation_mode_config",
+            "get_realtime_run_config",
             staticmethod(lambda: object()),
-        )
-        monkeypatch.setattr(
-            main.AgentRuntime,
-            "run_thinking_mode",
-            staticmethod(_empty_thinking_mode),
         )
         monkeypatch.setattr(
             main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -347,13 +326,8 @@ class TestPhase6WebSocketFlow:
         monkeypatch.setattr(main.types, "Blob", _FakeBlob)
         monkeypatch.setattr(
             main.AgentRuntime,
-            "get_conversation_mode_config",
+            "get_realtime_run_config",
             staticmethod(lambda: object()),
-        )
-        monkeypatch.setattr(
-            main.AgentRuntime,
-            "run_thinking_mode",
-            staticmethod(_empty_thinking_mode),
         )
         monkeypatch.setattr(
             main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -648,26 +622,3 @@ class TestAutonomySchedulingBoundaries:
         await main.reliability_bootstrap()
 
         reconcile_mock.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_agent_timer_payload_has_agent_ownership(self, monkeypatch):
-        set_user_token = set_timer_module.current_user_id.set("user_test")
-        set_session_token = set_timer_module.current_session_id.set("session_test")
-        create_event_mock = AsyncMock(return_value={"id": "event_checkin_1"})
-        create_cron_mock = AsyncMock(return_value=321)
-        update_cron_job_id_mock = AsyncMock(return_value=True)
-        try:
-            monkeypatch.setattr(set_timer_module, "_get_user_timezone", lambda: "UTC")
-            monkeypatch.setattr(set_timer_module.event_repo, "create_event", create_event_mock)
-            monkeypatch.setattr(set_timer_module.cron_service, "create_one_time_job", create_cron_mock)
-            monkeypatch.setattr(set_timer_module.event_repo, "update_cron_job_id", update_cron_job_id_mock)
-
-            response = await set_timer_module.set_checkin_timer(30, "deep_work_end")
-            assert "Timer set for" in response
-
-            payload = create_event_mock.await_args.kwargs["payload"]
-            assert payload["schedule_owner"] == "agent"
-            assert payload["schedule_policy"] == "autonomous_checkin"
-        finally:
-            set_timer_module.current_user_id.reset(set_user_token)
-            set_timer_module.current_session_id.reset(set_session_token)
