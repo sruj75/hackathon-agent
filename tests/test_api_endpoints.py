@@ -209,6 +209,46 @@ async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_execute_calendar_reminder_missing_timezone_skips_push(api_client, monkeypatch):
+    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
+    event = {
+        "id": "event_missing_tz",
+        "user_id": "user_test",
+        "event_type": "calendar_reminder",
+        "payload": {
+            "event_title": "Standup",
+            "event_start_time": "2099-01-01T09:00:00+00:00",
+            "calendar_event_id": "gcal_99",
+        },
+        "executed": False,
+        "cron_job_id": 22222,
+    }
+
+    get_event_mock = AsyncMock(return_value=event)
+    get_profile_mock = AsyncMock(return_value=None)
+    update_event_mock = AsyncMock(return_value=True)
+    delete_job_mock = AsyncMock(return_value=True)
+    send_push_mock = AsyncMock(return_value=True)
+
+    monkeypatch.setattr(main.event_repo, "get_by_id", get_event_mock)
+    monkeypatch.setattr(main.user_repo, "get_profile", get_profile_mock)
+    monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
+    monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
+    monkeypatch.setattr(main, "send_push_notification", send_push_mock)
+
+    response = await api_client.post("/api/execute-event/event_missing_tz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "executed"
+    assert body["push_sent"] is False
+    send_push_mock.assert_not_awaited()
+    update_event_mock.assert_awaited_once()
+    assert update_event_mock.await_args.kwargs["last_error"] == "missing_timezone"
+    delete_job_mock.assert_awaited_once_with(22222)
+
+
+@pytest.mark.asyncio
 async def test_get_preferences_not_found(api_client, monkeypatch):
     monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
 

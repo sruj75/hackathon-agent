@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 from composio import Composio, Action
 from datetime import datetime, timedelta
 import logging
-import pytz
 from zoneinfo import ZoneInfo
 
 from context import current_user_id, current_user_timezone
@@ -87,6 +86,65 @@ def _get_user_timezone() -> str:
         return cached_timezone
 
     raise ValueError("missing_timezone")
+
+
+def require_user_timezone() -> str:
+    """Require a valid timezone from user context/cache."""
+    return _get_user_timezone()
+
+
+def parse_iso_preserve_timezone(value: str) -> datetime:
+    """Parse ISO datetime while preserving UTC markers and offsets."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid_datetime")
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def today_in_user_timezone() -> str:
+    """Return YYYY-MM-DD for the user's timezone."""
+    tz_name = require_user_timezone()
+    return datetime.now(ZoneInfo(tz_name)).date().isoformat()
+
+
+def local_day_bounds(date_str: str, tz_name: str) -> tuple[datetime, datetime]:
+    """Build start/end datetimes for a local calendar day."""
+    tz = ZoneInfo(tz_name)
+    start = datetime.fromisoformat(f"{date_str}T00:00:00").replace(tzinfo=tz)
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    return start, end
+
+
+def _is_hhmm(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%H:%M")
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_user_datetime(
+    value: str,
+    tz_name: str,
+    *,
+    default_date: str | None = None,
+) -> datetime:
+    """
+    Parse time input for user operations.
+
+    - HH:MM is interpreted on default_date (or today's local user date)
+    - ISO with offset/Z preserves instant and converts into user timezone
+    - Naive ISO is interpreted as local user time
+    """
+    tz = ZoneInfo(tz_name)
+    if _is_hhmm(value):
+        date_str = default_date or datetime.now(tz).date().isoformat()
+        parsed_local = datetime.fromisoformat(f"{date_str}T{value}:00")
+        return parsed_local.replace(tzinfo=tz)
+
+    parsed = parse_iso_preserve_timezone(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
 
 
 def _run_async_task(coro, *, label: str) -> None:
@@ -177,16 +235,17 @@ def list_todays_events() -> dict:
     Returns:
         Structured dict with events data and human-readable message.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    
     try:
+        user_tz = require_user_timezone()
+        today = today_in_user_timezone()
+        day_start, day_end = local_day_bounds(today, user_tz)
         result = _get_entity().execute(
             action=Action.GOOGLECALENDAR_EVENTS_LIST,
             params={
                 "calendar_id": "primary",
-                "time_min": f"{today}T00:00:00",
-                "time_max": f"{today}T23:59:59",
-                "timezone": _get_user_timezone(),
+                "time_min": day_start.isoformat(),
+                "time_max": day_end.isoformat(),
+                "timezone": user_tz,
                 "single_events": True,
                 "order_by": "startTime"
             }
@@ -254,19 +313,9 @@ def create_calendar_event(title: str, start_time: str, duration_minutes: int = 6
         Structured dict with created event data.
     """
     try:
-        user_tz = _get_user_timezone()
-        tz = pytz.timezone(user_tz)
-        
-        # Handle simple time format like "14:00"
-        if len(start_time) <= 5 and ":" in start_time:
-            today = datetime.now().strftime("%Y-%m-%d")
-            # Create timezone-aware datetime in user's timezone
-            start_dt = tz.localize(datetime.fromisoformat(f"{today}T{start_time}:00"))
-        else:
-            start_dt = datetime.fromisoformat(start_time.replace("Z", ""))
-            # If naive, localize to user's timezone
-            if start_dt.tzinfo is None:
-                start_dt = tz.localize(start_dt)
+        user_tz = require_user_timezone()
+        today = today_in_user_timezone()
+        start_dt = _parse_user_datetime(start_time, user_tz, default_date=today)
         
         end_dt = start_dt + timedelta(minutes=duration_minutes)
         
@@ -333,14 +382,21 @@ def find_free_slots(duration_minutes: int = 30) -> dict:
     Returns:
         Structured dict with free time slots.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    
     try:
+        user_tz = require_user_timezone()
+        today = today_in_user_timezone()
+        local_start = datetime.fromisoformat(f"{today}T08:00:00").replace(
+            tzinfo=ZoneInfo(user_tz)
+        )
+        local_end = datetime.fromisoformat(f"{today}T20:00:00").replace(
+            tzinfo=ZoneInfo(user_tz)
+        )
         result = _get_entity().execute(
             action=Action.GOOGLECALENDAR_FIND_FREE_SLOTS,
             params={
-                "time_min": f"{today}T08:00:00Z",
-                "time_max": f"{today}T20:00:00Z",
+                "time_min": local_start.isoformat(),
+                "time_max": local_end.isoformat(),
+                "timezone": user_tz,
                 "calendar_ids": ["primary"]
             }
         )
@@ -358,11 +414,11 @@ def find_free_slots(duration_minutes: int = 30) -> dict:
             slot_duration = 0
             if "T" in start and "T" in end:
                 try:
-                    start_dt = datetime.fromisoformat(start.replace("Z", ""))
-                    end_dt = datetime.fromisoformat(end.replace("Z", ""))
+                    start_dt = parse_iso_preserve_timezone(start)
+                    end_dt = parse_iso_preserve_timezone(end)
                     slot_duration = int((end_dt - start_dt).total_seconds() / 60)
-                except:
-                    pass
+                except Exception:
+                    slot_duration = 0
             
             slots.append({
                 "start": start,
@@ -407,16 +463,18 @@ def delete_event(event_title: str) -> dict:
     Returns:
         Structured dict with deletion confirmation.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    
     try:
+        user_tz = require_user_timezone()
+        today = today_in_user_timezone()
+        day_start, _ = local_day_bounds(today, user_tz)
         # First find the event
         result = _get_entity().execute(
             action=Action.GOOGLECALENDAR_FIND_EVENT,
             params={
                 "calendar_id": "primary",
                 "query": event_title,
-                "time_min": f"{today}T00:00:00Z"
+                "time_min": day_start.isoformat(),
+                "timezone": user_tz,
             }
         )
         
@@ -533,16 +591,18 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
     Returns:
         Structured dict with updated event data.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    
     try:
+        user_tz = require_user_timezone()
+        today = today_in_user_timezone()
+        day_start, _ = local_day_bounds(today, user_tz)
         # First find the event
         result = _get_entity().execute(
             action=Action.GOOGLECALENDAR_FIND_EVENT,
             params={
                 "calendar_id": "primary",
                 "query": event_title,
-                "time_min": f"{today}T00:00:00Z"
+                "time_min": day_start.isoformat(),
+                "timezone": user_tz,
             }
         )
         
@@ -574,16 +634,7 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
         final_end = event.get("end", {}).get("dateTime", "")
         
         if new_start_time:
-            # Handle simple time format like "14:00"
-            user_tz = _get_user_timezone()
-            tz = pytz.timezone(user_tz)
-            
-            if len(new_start_time) <= 5 and ":" in new_start_time:
-                start_dt = tz.localize(datetime.fromisoformat(f"{today}T{new_start_time}:00"))
-            else:
-                start_dt = datetime.fromisoformat(new_start_time.replace("Z", ""))
-                if start_dt.tzinfo is None:
-                    start_dt = tz.localize(start_dt)
+            start_dt = _parse_user_datetime(new_start_time, user_tz, default_date=today)
             
             patch_params["start"] = {"dateTime": start_dt.isoformat(), "timeZone": user_tz}
             
@@ -598,9 +649,9 @@ def modify_event(event_title: str, new_title: str = None, new_start_time: str = 
             # Keep existing start, just update duration
             existing_start = event.get("start", {}).get("dateTime", "")
             if existing_start:
-                start_dt = datetime.fromisoformat(existing_start.replace("Z", ""))
+                start_dt = _parse_user_datetime(existing_start, user_tz, default_date=today)
                 end_dt = start_dt + timedelta(minutes=new_duration_minutes)
-                patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": _get_user_timezone()}
+                patch_params["end"] = {"dateTime": end_dt.isoformat(), "timeZone": user_tz}
                 final_end = end_dt.isoformat()
         
         # Execute the patch
@@ -768,9 +819,10 @@ def get_schedule(date: str = "today", after_time: str = None, include_tasks: boo
         Structured dict with filtered events list.
     """
     try:
+        user_tz = require_user_timezone()
         # Parse date
         if date == "today":
-            target_date = datetime.now().strftime("%Y-%m-%d")
+            target_date = today_in_user_timezone()
         else:
             # Validate date format
             try:
@@ -782,15 +834,23 @@ def get_schedule(date: str = "today", after_time: str = None, include_tasks: boo
                     "error": "invalid_date",
                     "message": f"Invalid date format: {date}. Use 'today' or 'YYYY-MM-DD'"
                 }
+        if after_time and not _is_hhmm(after_time):
+            return {
+                "success": False,
+                "error": "invalid_after_time",
+                "message": f"Invalid after_time format: {after_time}. Use 'HH:MM'"
+            }
+
+        day_start, day_end = local_day_bounds(target_date, user_tz)
         
         # Fetch events for the full day
         result = _get_entity().execute(
             action=Action.GOOGLECALENDAR_EVENTS_LIST,
             params={
                 "calendar_id": "primary",
-                "time_min": f"{target_date}T00:00:00",
-                "time_max": f"{target_date}T23:59:59",
-                "timezone": _get_user_timezone(),
+                "time_min": day_start.isoformat(),
+                "time_max": day_end.isoformat(),
+                "timezone": user_tz,
                 "single_events": True,
                 "order_by": "startTime"
             }
@@ -867,28 +927,26 @@ def check_conflicts(start_time: str, end_time: str) -> dict:
         Structured dict with has_conflicts flag and list of conflicting events.
     """
     try:
-        # Parse start and end times
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        # Handle simple time format like "14:00"
-        if len(start_time) <= 5 and ":" in start_time:
-            start_dt = datetime.fromisoformat(f"{today}T{start_time}:00")
-        else:
-            start_dt = datetime.fromisoformat(start_time.replace("Z", ""))
-        
-        if len(end_time) <= 5 and ":" in end_time:
-            end_dt = datetime.fromisoformat(f"{today}T{end_time}:00")
-        else:
-            end_dt = datetime.fromisoformat(end_time.replace("Z", ""))
+        user_tz = require_user_timezone()
+        today = today_in_user_timezone()
+        start_dt = _parse_user_datetime(start_time, user_tz, default_date=today)
+        end_dt = _parse_user_datetime(end_time, user_tz, default_date=today)
+        if end_dt <= start_dt:
+            return {
+                "success": False,
+                "error": "invalid_time_range",
+                "data": {"has_conflicts": False, "conflicts": []},
+                "message": "end_time must be after start_time"
+            }
         
         # Query events in the time range
         result = _get_entity().execute(
             action=Action.GOOGLECALENDAR_EVENTS_LIST,
             params={
                 "calendar_id": "primary",
-                "time_min": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "time_max": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timezone": _get_user_timezone(),
+                "time_min": start_dt.isoformat(),
+                "time_max": end_dt.isoformat(),
+                "timezone": user_tz,
                 "single_events": True,
                 "order_by": "startTime"
             }

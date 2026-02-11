@@ -689,10 +689,9 @@ def _require_execute_event_secret(secret: str | None = Query(default=None)) -> N
         raise HTTPException(status_code=401, detail="Invalid event secret")
 
 
-def _format_calendar_reminder_body(payload: dict) -> str:
+def _format_calendar_reminder_body(payload: dict, timezone_name: str) -> str:
     event_title = str(payload.get("event_title") or "upcoming event")
     start_raw = payload.get("event_start_time")
-    timezone_name = _normalize_timezone(payload.get("timezone")) or "UTC"
     try:
         if isinstance(start_raw, str):
             start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
@@ -702,6 +701,19 @@ def _format_calendar_reminder_body(payload: dict) -> str:
     except Exception:
         pass
     return f"{event_title} starts soon."
+
+
+async def _resolve_calendar_reminder_timezone(
+    event_user_id: str,
+    payload: dict,
+) -> str | None:
+    """Resolve calendar reminder timezone from payload first, then profile."""
+    timezone_name = _normalize_timezone(payload.get("timezone"))
+    if timezone_name:
+        return timezone_name
+
+    profile = await user_repo.get_profile(event_user_id)
+    return _normalize_timezone((profile or {}).get("timezone"))
 
 
 @app.post("/api/execute-event/{event_id}")
@@ -732,6 +744,13 @@ async def execute_event(
         raise HTTPException(status_code=500, detail="Event missing user_id")
 
     payload = _event_field(event, "payload", {}) or {}
+    calendar_timezone: str | None = None
+    if event_type == "calendar_reminder":
+        calendar_timezone = await _resolve_calendar_reminder_timezone(event_user_id, payload)
+        if calendar_timezone:
+            payload = dict(payload)
+            payload["timezone"] = calendar_timezone
+
     reason = str(payload.get("reason") or "scheduled_checkin")
     session_id = ADKSessionManager.get_daily_session_id(event_user_id)
     trigger_type = str(payload.get("trigger_type") or event_type)
@@ -744,7 +763,10 @@ async def execute_event(
         body = "Ready to plan your day?"
     elif event_type == "calendar_reminder":
         title = f"Upcoming: {payload.get('event_title') or 'Event'}"
-        body = _format_calendar_reminder_body(payload)
+        if calendar_timezone:
+            body = _format_calendar_reminder_body(payload, calendar_timezone)
+        else:
+            body = "Reminder unavailable: missing timezone."
     elif event_type == "checkin":
         title = "Check-in"
         body = f"It is time for your check-in ({reason})."
@@ -759,24 +781,36 @@ async def execute_event(
     if isinstance(calendar_event_id, str) and calendar_event_id:
         notification_data["calendar_event_id"] = calendar_event_id
 
-    logger.info(
-        "[execute-event] Dispatching push user=%s event_id=%s event_type=%s",
-        event_user_id,
-        event_id,
-        event_type,
-    )
-    push_sent = await send_push_notification(
-        event_user_id,
-        title,
-        body,
-        notification_data,
-    )
+    push_sent = False
+    if event_type == "calendar_reminder" and not calendar_timezone:
+        logger.warning(
+            "[execute-event] Skipping calendar reminder push due to missing timezone user=%s event_id=%s",
+            event_user_id,
+            event_id,
+        )
+    else:
+        logger.info(
+            "[execute-event] Dispatching push user=%s event_id=%s event_type=%s",
+            event_user_id,
+            event_id,
+            event_type,
+        )
+        push_sent = await send_push_notification(
+            event_user_id,
+            title,
+            body,
+            notification_data,
+        )
 
     now_utc = datetime.now(timezone.utc)
+    last_error = None if push_sent else "push_failed_or_missing_token"
+    if event_type == "calendar_reminder" and not calendar_timezone:
+        last_error = "missing_timezone"
+
     await event_repo.update_event(
         event_id,
         executed=True,
-        last_error=None if push_sent else "push_failed_or_missing_token",
+        last_error=last_error,
         last_attempt_at=now_utc,
     )
     

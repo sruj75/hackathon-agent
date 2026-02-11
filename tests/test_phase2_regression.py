@@ -51,6 +51,7 @@ async def test_phase2_cron_missing_api_key_errors_cleanly():
             await cron_service.create_one_time_job(
                 target_datetime=datetime.utcnow(),
                 event_id="phase2_missing_key",
+                timezone="UTC",
             )
 
 

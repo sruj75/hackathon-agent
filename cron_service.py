@@ -20,7 +20,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
 async def create_one_time_job(
     target_datetime: datetime,
     event_id: str,
-    timezone: str = "UTC"
+    timezone: str,
 ) -> int:
     """
     Creates a one-time cron job that fires at the specified datetime.
@@ -38,6 +38,8 @@ async def create_one_time_job(
     """
     if not CRONJOB_API_KEY:
         raise ValueError("CRONJOB_ORG_API_KEY environment variable not set")
+    if not isinstance(timezone, str) or not timezone.strip():
+        raise ValueError("missing_timezone")
     
     # Calculate expiration time (5 minutes after target to ensure one-time execution)
     expires_at = target_datetime + timedelta(minutes=5)

@@ -100,7 +100,8 @@ class TestCronService:
             with pytest.raises(ValueError, match="CRONJOB_ORG_API_KEY"):
                 await cron_service.create_one_time_job(
                     target_datetime=target_datetime,
-                    event_id=event_id
+                    event_id=event_id,
+                    timezone="UTC",
                 )
 
     @pytest.mark.asyncio
@@ -124,7 +125,8 @@ class TestCronService:
             with pytest.raises(Exception, match="Failed to create cron job"):
                 await cron_service.create_one_time_job(
                     target_datetime=target_datetime,
-                    event_id=event_id
+                    event_id=event_id,
+                    timezone="UTC",
                 )
 
     @pytest.mark.asyncio
@@ -143,7 +145,8 @@ class TestCronService:
             with pytest.raises(ValueError, match="No jobId in response"):
                 await cron_service.create_one_time_job(
                     target_datetime=target_datetime,
-                    event_id=event_id
+                    event_id=event_id,
+                    timezone="UTC",
                 )
 
     @pytest.mark.asyncio
@@ -159,7 +162,8 @@ class TestCronService:
             with pytest.raises(Exception):
                 await cron_service.create_one_time_job(
                     target_datetime=target_datetime,
-                    event_id=event_id
+                    event_id=event_id,
+                    timezone="UTC",
                 )
 
     @pytest.mark.asyncio
@@ -272,7 +276,8 @@ class TestCronService:
             with patch('cron_service.CRONJOB_API_KEY', 'test_api_key'):
                 await cron_service.create_one_time_job(
                     target_datetime=target_dt,
-                    event_id="test"
+                    event_id="test",
+                    timezone="UTC",
                 )
             
             call_args = mock_cron_api.put.call_args
@@ -294,7 +299,8 @@ class TestCronService:
         with patch('cron_service.CRONJOB_API_KEY', 'test_api_key'):
             await cron_service.create_one_time_job(
                 target_datetime=target_datetime,
-                event_id="test"
+                event_id="test",
+                timezone="UTC",
             )
         
         call_args = mock_cron_api.put.call_args
@@ -317,7 +323,8 @@ class TestCronService:
             with patch('cron_service.BACKEND_URL', 'https://my-backend.com'):
                 await cron_service.create_one_time_job(
                     target_datetime=target_datetime,
-                    event_id=event_id
+                    event_id=event_id,
+                    timezone="UTC",
                 )
         
         call_args = mock_cron_api.put.call_args
@@ -336,11 +343,24 @@ class TestCronService:
         with patch('cron_service.CRONJOB_API_KEY', 'test_api_key'):
             await cron_service.create_one_time_job(
                 target_datetime=target_datetime,
-                event_id="test"
+                event_id="test",
+                timezone="UTC",
             )
-        
+
         call_args = mock_cron_api.put.call_args
         payload = call_args.kwargs['json']
         
         # requestMethod 1 = POST
         assert payload['job']['requestMethod'] == 1
+
+    @pytest.mark.asyncio
+    async def test_create_one_time_job_missing_timezone(self):
+        """Missing timezone should fail fast."""
+        target_datetime = datetime(2026, 2, 5, 8, 0, 0)
+        with patch('cron_service.CRONJOB_API_KEY', 'test_api_key'):
+            with pytest.raises(ValueError, match="missing_timezone"):
+                await cron_service.create_one_time_job(
+                    target_datetime=target_datetime,
+                    event_id="test_event",
+                    timezone="",
+                )
