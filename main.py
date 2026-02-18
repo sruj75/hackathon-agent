@@ -726,7 +726,7 @@ async def execute_event(
 ):
     """
     Execute a specific scheduled event.
-    Called by cron-jobs.org at the scheduled time.
+    Called by the scheduler at the scheduled time.
     
     Security: Event IDs are UUIDs (unguessable) and execution is idempotent.
     """
@@ -817,7 +817,7 @@ async def execute_event(
         last_attempt_at=now_utc,
     )
     
-    # Cleanup: Delete the cron job from cron-jobs.org
+    # Cleanup: delete the pg_cron job
     event_cron_job_id = _event_field(event, "cron_job_id")
     if event_cron_job_id:
         try:
