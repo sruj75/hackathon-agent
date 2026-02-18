@@ -1,7 +1,7 @@
 """Integration tests for complete end-to-end flows using repository interfaces."""
 
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from freezegun import freeze_time
@@ -15,6 +15,8 @@ from session_manager import ADKSessionManager
 def in_memory_event_repo(monkeypatch):
     """Patch event_repo with a deterministic in-memory store."""
     events: dict[str, dict] = {}
+    scheduled_jobs: set[int] = set()
+    next_job_id = {"value": 1000}
 
     async def create_event(
         user_id: str,
@@ -49,10 +51,24 @@ def in_memory_event_repo(monkeypatch):
     async def get_by_id(event_id: str) -> dict | None:
         return events.get(event_id)
 
+    async def schedule_event_job(event_id: str, run_at: datetime, timezone_name: str) -> int:
+        _ = (event_id, run_at, timezone_name)
+        next_job_id["value"] += 1
+        job_id = next_job_id["value"]
+        scheduled_jobs.add(job_id)
+        return job_id
+
+    async def unschedule_event_job(job_id: int | None) -> bool:
+        if not job_id:
+            return False
+        return int(job_id) in scheduled_jobs
+
     monkeypatch.setattr(event_repo, "create_event", create_event)
     monkeypatch.setattr(event_repo, "update_cron_job_id", update_cron_job_id)
     monkeypatch.setattr(event_repo, "mark_executed", mark_executed)
     monkeypatch.setattr(event_repo, "get_by_id", get_by_id)
+    monkeypatch.setattr(event_repo, "schedule_event_job", schedule_event_job)
+    monkeypatch.setattr(event_repo, "unschedule_event_job", unschedule_event_job)
     return events
 
 
@@ -132,7 +148,6 @@ class TestMorningWakeFlow:
         monkeypatch,
         in_memory_event_repo,
         in_memory_session_repo,
-        mock_cron_api,
     ):
         wake_time = datetime(2026, 2, 5, 8, 0, 0)
         user_id = "test_user"
@@ -144,13 +159,11 @@ class TestMorningWakeFlow:
             payload={"reason": "daily_kickoff"},
         )
 
-        mock_cron_api.put.return_value.json.return_value = {"jobId": 99999}
-        with patch("cron_service.CRONJOB_API_KEY", "test_key"):
-            cron_job_id = await cron_service.create_one_time_job(
-                target_datetime=wake_time,
-                event_id=event["id"],
-                timezone="UTC",
-            )
+        cron_job_id = await cron_service.create_one_time_job(
+            target_datetime=wake_time,
+            event_id=event["id"],
+            timezone="UTC",
+        )
 
         updated = await event_repo.update_cron_job_id(event["id"], cron_job_id)
         assert updated is True
@@ -173,7 +186,7 @@ class TestMorningWakeFlow:
         await event_repo.mark_executed(event["id"])
         final_event = await event_repo.get_by_id(event["id"])
         assert final_event["executed"] is True
-        assert final_event["cron_job_id"] == 99999
+        assert final_event["cron_job_id"] == cron_job_id
 
 
 @pytest.mark.integration
@@ -186,7 +199,6 @@ class TestCheckinFlow:
         monkeypatch,
         in_memory_event_repo,
         in_memory_session_repo,
-        mock_cron_api,
     ):
         scheduled_time = datetime.utcnow() + timedelta(minutes=30)
         user_id = "test_user"
@@ -198,13 +210,11 @@ class TestCheckinFlow:
             payload={"reason": "deep_work_end"},
         )
 
-        mock_cron_api.put.return_value.json.return_value = {"jobId": 55555}
-        with patch("cron_service.CRONJOB_API_KEY", "test_key"):
-            cron_job_id = await cron_service.create_one_time_job(
-                target_datetime=scheduled_time,
-                event_id=event["id"],
-                timezone="UTC",
-            )
+        cron_job_id = await cron_service.create_one_time_job(
+            target_datetime=scheduled_time,
+            event_id=event["id"],
+            timezone="UTC",
+        )
 
         updated = await event_repo.update_cron_job_id(event["id"], cron_job_id)
         assert updated is True
@@ -223,9 +233,7 @@ class TestCheckinFlow:
 
         await event_repo.mark_executed(event["id"])
 
-        mock_cron_api.delete.return_value.status_code = 200
-        with patch("cron_service.CRONJOB_API_KEY", "test_key"):
-            deleted = await cron_service.delete_job(cron_job_id)
+        deleted = await cron_service.delete_job(cron_job_id)
 
         assert deleted is True
         final_event = await event_repo.get_by_id(event["id"])

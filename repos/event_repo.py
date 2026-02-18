@@ -82,6 +82,39 @@ async def update_cron_job_id(event_id: str, cron_job_id: int) -> bool:
     return result.endswith("1")
 
 
+async def schedule_event_job(
+    event_id: str,
+    run_at: datetime,
+    timezone_name: str,
+) -> int:
+    """Create a one-time pg_cron job for an event and return its job id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT public.schedule_event_job($1, $2, $3) AS job_id",
+            event_id,
+            run_at,
+            timezone_name,
+        )
+    if not row or row["job_id"] is None:
+        raise ValueError("schedule_event_job returned no job_id")
+    return int(row["job_id"])
+
+
+async def unschedule_event_job(job_id: int | None) -> bool:
+    """Delete a pg_cron job by id."""
+    if not job_id:
+        return False
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT public.unschedule_event_job($1) AS removed",
+            int(job_id),
+        )
+    return bool(row and row["removed"])
+
+
 async def update_event(event_id: str, **kwargs) -> bool:
     """Update arbitrary fields for an event."""
     update_data = {k: v for k, v in kwargs.items() if k in _UPDATE_COLUMNS}

@@ -6,7 +6,7 @@ context vars, cron wiring, event lifecycle, and runtime interfaces.
 """
 import inspect
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -27,17 +27,18 @@ async def test_phase2_context_vars_are_settable(test_user):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_phase2_cron_create_and_delete(mock_cron_api):
-    mock_cron_api.put.return_value.json.return_value = {"jobId": 424242}
-    mock_cron_api.delete.return_value.status_code = 200
+async def test_phase2_cron_create_and_delete(monkeypatch):
+    schedule_mock = AsyncMock(return_value=424242)
+    unschedule_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(cron_service.event_repo, "schedule_event_job", schedule_mock)
+    monkeypatch.setattr(cron_service.event_repo, "unschedule_event_job", unschedule_mock)
 
-    with patch("cron_service.CRONJOB_API_KEY", "test_key"):
-        job_id = await cron_service.create_one_time_job(
-            target_datetime=datetime(2026, 2, 7, 9, 0, 0),
-            event_id="phase2_event",
-            timezone="UTC",
-        )
-        deleted = await cron_service.delete_job(job_id)
+    job_id = await cron_service.create_one_time_job(
+        target_datetime=datetime(2026, 2, 7, 9, 0, 0),
+        event_id="phase2_event",
+        timezone="UTC",
+    )
+    deleted = await cron_service.delete_job(job_id)
 
     assert job_id == 424242
     assert deleted is True
@@ -45,14 +46,13 @@ async def test_phase2_cron_create_and_delete(mock_cron_api):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_phase2_cron_missing_api_key_errors_cleanly():
-    with patch("cron_service.CRONJOB_API_KEY", None):
-        with pytest.raises(ValueError, match="CRONJOB_ORG_API_KEY"):
-            await cron_service.create_one_time_job(
-                target_datetime=datetime.utcnow(),
-                event_id="phase2_missing_key",
-                timezone="UTC",
-            )
+async def test_phase2_cron_missing_timezone_errors_cleanly():
+    with pytest.raises(ValueError, match="missing_timezone"):
+        await cron_service.create_one_time_job(
+            target_datetime=datetime.utcnow(),
+            event_id="phase2_missing_timezone",
+            timezone="",
+        )
 
 
 @pytest.mark.regression
