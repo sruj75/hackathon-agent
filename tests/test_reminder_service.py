@@ -11,8 +11,6 @@ import reminder_service
 
 @pytest.mark.asyncio
 async def test_schedule_calendar_reminder_creates_t_minus_five(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUTOMATED_EVENT_REMINDERS", "true")
-
     list_pending_mock = AsyncMock(return_value=[])
     create_event_mock = AsyncMock(return_value={"id": "reminder_1"})
     create_cron_mock = AsyncMock(return_value=12345)
@@ -45,7 +43,6 @@ async def test_schedule_calendar_reminder_creates_t_minus_five(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_schedule_calendar_reminder_uses_immediate_window(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUTOMATED_EVENT_REMINDERS", "true")
     now_utc = datetime.now(ZoneInfo("UTC"))
     start_soon = now_utc + timedelta(minutes=2)
 
@@ -85,7 +82,6 @@ async def test_schedule_calendar_reminder_uses_immediate_window(monkeypatch):
 @pytest.mark.asyncio
 @time_machine.travel("2024-01-15T12:00:00+00:00", tick=False)
 async def test_schedule_calendar_reminder_overwrites_existing(monkeypatch):
-    monkeypatch.setenv("ENABLE_AUTOMATED_EVENT_REMINDERS", "true")
     existing = {
         "id": "reminder_existing",
         "cron_job_id": 100,

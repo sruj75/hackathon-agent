@@ -15,10 +15,11 @@ logger = logging.getLogger(__name__)
 CRONJOB_API_URL = "https://api.cron-job.org"
 CRONJOB_API_KEY = os.getenv("CRONJOB_ORG_API_KEY")
 _CRONJOB_API_KEY_MISSING_AT_IMPORT = CRONJOB_API_KEY is None
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
-_BACKEND_URL_DEFAULT_AT_IMPORT = (
-    BACKEND_URL == "http://localhost:8080" and "BACKEND_URL" not in os.environ
+BACKEND_URL = (
+    os.getenv("BACKEND_URL")
+    or os.getenv("RENDER_EXTERNAL_URL")
 )
+_BACKEND_URL_MISSING_AT_IMPORT = BACKEND_URL is None
 
 
 def _get_runtime_api_key() -> str | None:
@@ -32,11 +33,20 @@ def _get_runtime_api_key() -> str | None:
 
 def _get_runtime_backend_url() -> str:
     """Resolve backend URL at call time to support late-loaded env vars."""
-    if BACKEND_URL != "http://localhost:8080":
-        return BACKEND_URL.rstrip("/")
-    if _BACKEND_URL_DEFAULT_AT_IMPORT:
-        return os.getenv("BACKEND_URL", BACKEND_URL).rstrip("/")
-    return BACKEND_URL.rstrip("/")
+    # If BACKEND_URL existed at import time, treat module constant as authoritative
+    # so tests can reliably patch it.
+    if BACKEND_URL is not None or not _BACKEND_URL_MISSING_AT_IMPORT:
+        runtime_backend_url = BACKEND_URL
+    else:
+        runtime_backend_url = (
+            os.getenv("BACKEND_URL")
+            or os.getenv("RENDER_EXTERNAL_URL")
+        )
+
+    if not runtime_backend_url:
+        raise ValueError("BACKEND_URL environment variable not set")
+
+    return runtime_backend_url.rstrip("/")
 
 
 async def create_one_time_job(

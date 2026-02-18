@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from composio import Composio
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables BEFORE importing agent
@@ -48,7 +48,6 @@ from agent_runtime import AgentRuntime
 import cron_service
 from db import close_pool
 from notification_service import send_push_notification
-from reminder_service import reminders_enabled
 
 # Configure logging
 logging.basicConfig(
@@ -694,12 +693,6 @@ async def get_composio_status(current_user: AuthUser = Depends(get_authenticated
 # ========================================
 
 
-def _require_execute_event_secret(secret: str | None = Query(default=None)) -> None:
-    expected_secret = os.getenv("EXECUTE_EVENT_SECRET")
-    if expected_secret and secret != expected_secret:
-        raise HTTPException(status_code=401, detail="Invalid event secret")
-
-
 def _format_calendar_reminder_body(payload: dict, timezone_name: str) -> str:
     event_title = str(payload.get("event_title") or "upcoming event")
     start_raw = payload.get("event_start_time")
@@ -730,7 +723,6 @@ async def _resolve_calendar_reminder_timezone(
 @app.post("/api/execute-event/{event_id}")
 async def execute_event(
     event_id: str,
-    _: None = Depends(_require_execute_event_secret),
 ):
     """
     Execute a specific scheduled event.
@@ -874,10 +866,7 @@ class AppLifecycle:
             logger.info("[bootstrap] Reliability bootstrap disabled by env")
             return
 
-        logger.info(
-            "[bootstrap] Automated event reminders enabled=%s",
-            reminders_enabled(),
-        )
+        logger.info("[bootstrap] Automated event reminders enabled")
 
         try:
             users = await user_repo.get_all_users()
@@ -1204,7 +1193,10 @@ if __name__ == "__main__":
     import uvicorn
     # Get host and port from environment variables with defaults
     host = os.getenv("BACKEND_HOST", "0.0.0.0")
-    port = int(os.getenv("BACKEND_PORT", "8000"))
+    port_raw = os.getenv("PORT")
+    if not port_raw:
+        raise RuntimeError("PORT environment variable not set")
+    port = int(port_raw)
     
     logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)

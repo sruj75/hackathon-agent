@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
-import os
 from zoneinfo import ZoneInfo
 
 import cron_service
@@ -15,15 +14,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LEAD_MINUTES = 5
 IMMEDIATE_DELAY_SECONDS = 10
-
-
-def reminders_enabled() -> bool:
-    """Feature gate for automated event reminders."""
-    return os.getenv("ENABLE_AUTOMATED_EVENT_REMINDERS", "true").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
 
 
 def _coerce_event_start_time(
@@ -58,9 +48,6 @@ async def schedule_calendar_reminder(
     source: str = "agent_timeblock",
 ) -> dict:
     """Create or reschedule a single pending reminder row for a calendar event."""
-    if not reminders_enabled():
-        return {"status": "disabled"}
-
     start_local = _coerce_event_start_time(event_start_time, timezone_name)
     now_local = datetime.now(ZoneInfo(timezone_name))
     reminder_at = start_local - timedelta(minutes=lead_minutes)

@@ -73,7 +73,6 @@ async def test_save_token_rejects_invalid_payload(api_client):
 
 @pytest.mark.asyncio
 async def test_execute_event_not_found(api_client, monkeypatch):
-    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     monkeypatch.setattr(main.event_repo, "get_by_id", AsyncMock(return_value=None))
 
     response = await api_client.post("/api/execute-event/event_missing")
@@ -84,7 +83,6 @@ async def test_execute_event_not_found(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_event_already_executed(api_client, monkeypatch):
-    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     monkeypatch.setattr(
         main.event_repo,
         "get_by_id",
@@ -98,36 +96,7 @@ async def test_execute_event_already_executed(api_client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_event_requires_secret_when_configured(api_client, monkeypatch):
-    monkeypatch.setenv("EXECUTE_EVENT_SECRET", "shh")
-    monkeypatch.setattr(
-        main.event_repo,
-        "get_by_id",
-        AsyncMock(
-            return_value={
-                "id": "event_123",
-                "executed": False,
-                "user_id": "user_test",
-                "event_type": "checkin",
-                "payload": {},
-                "cron_job_id": None,
-            }
-        ),
-    )
-    monkeypatch.setattr(main.event_repo, "update_event", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "send_push_notification", AsyncMock(return_value=True))
-    monkeypatch.setattr(main.cron_service, "delete_job", AsyncMock(return_value=True))
-
-    unauthorized = await api_client.post("/api/execute-event/event_123")
-    assert unauthorized.status_code == 401
-
-    authorized = await api_client.post("/api/execute-event/event_123?secret=shh")
-    assert authorized.status_code == 200
-
-
-@pytest.mark.asyncio
 async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
-    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     event = {
         "id": "event_123",
         "user_id": "user_test",
@@ -168,7 +137,6 @@ async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
-    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     event = {
         "id": "event_retry",
         "user_id": "user_test",
@@ -210,7 +178,6 @@ async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_calendar_reminder_missing_timezone_skips_push(api_client, monkeypatch):
-    monkeypatch.delenv("EXECUTE_EVENT_SECRET", raising=False)
     event = {
         "id": "event_missing_tz",
         "user_id": "user_test",

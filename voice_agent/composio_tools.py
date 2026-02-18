@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 from context import current_user_id, current_user_timezone
 from reminder_service import (
     cancel_calendar_reminders,
-    reminders_enabled,
     schedule_calendar_reminder,
 )
 
@@ -766,7 +765,7 @@ def timeblock_task(task_title: str, start_time: str, duration_minutes: int = 60,
         except LookupError:
             tool_user_id = None
 
-        if reminders_enabled() and tool_user_id and event_id:
+        if tool_user_id and event_id:
             try:
                 user_timezone = _get_user_timezone()
                 _run_async_task(
@@ -1406,7 +1405,7 @@ def delete_task(task_title: str) -> dict:
                     tool_user_id = current_user_id.get()
                 except LookupError:
                     tool_user_id = None
-                if reminders_enabled() and tool_user_id:
+                if tool_user_id:
                     _run_async_task(
                         cancel_calendar_reminders(
                             user_id=tool_user_id,
