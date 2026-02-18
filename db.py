@@ -26,10 +26,10 @@ async def get_pool() -> asyncpg.Pool:
         if _pool is not None:
             return _pool
 
-        db_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+        db_url = os.getenv("SUPABASE_DB_URL")
         if not db_url:
             raise ValueError(
-                "Missing database URL. Set SUPABASE_DB_URL (or DATABASE_URL)."
+                "Missing database URL. Set SUPABASE_DB_URL."
             )
 
         _pool = await asyncpg.create_pool(
