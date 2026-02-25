@@ -8,7 +8,15 @@ from typing import List, Optional
 
 from db import get_pool
 
-_PROFILE_COLUMNS = {"wake_time", "bedtime", "timezone", "health_anchors"}
+_PROFILE_COLUMNS = {
+    "wake_time",
+    "bedtime",
+    "timezone",
+    "health_anchors",
+    "onboarding_status",
+    "onboarding_completed_at",
+    "playbook",
+}
 
 
 def _row_to_dict(row) -> dict:
@@ -25,6 +33,9 @@ async def create_profile(
     bedtime: str,
     timezone: str | None = None,
     health_anchors: Optional[List[str]] = None,
+    onboarding_status: str = "pending",
+    onboarding_completed_at: Optional[datetime] = None,
+    playbook: Optional[dict] = None,
 ) -> dict:
     """Create a new user profile."""
     now = _utcnow()
@@ -34,6 +45,9 @@ async def create_profile(
         "bedtime": bedtime,
         "timezone": timezone,
         "health_anchors": health_anchors or [],
+        "onboarding_status": onboarding_status,
+        "onboarding_completed_at": onboarding_completed_at,
+        "playbook": playbook or {},
         "created_at": now,
         "updated_at": now,
     }
@@ -43,13 +57,17 @@ async def create_profile(
         row = await conn.fetchrow(
             """
             INSERT INTO users (
-                user_id, wake_time, bedtime, timezone, health_anchors, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                user_id, wake_time, bedtime, timezone, health_anchors, onboarding_status,
+                onboarding_completed_at, playbook, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, $10)
             ON CONFLICT (user_id) DO UPDATE SET
                 wake_time = EXCLUDED.wake_time,
                 bedtime = EXCLUDED.bedtime,
                 timezone = EXCLUDED.timezone,
                 health_anchors = EXCLUDED.health_anchors,
+                onboarding_status = EXCLUDED.onboarding_status,
+                onboarding_completed_at = EXCLUDED.onboarding_completed_at,
+                playbook = EXCLUDED.playbook,
                 updated_at = EXCLUDED.updated_at
             RETURNING *
             """,
@@ -58,6 +76,9 @@ async def create_profile(
             bedtime,
             timezone,
             health_anchors or [],
+            onboarding_status,
+            onboarding_completed_at,
+            playbook or {},
             now,
             now,
         )
@@ -86,7 +107,7 @@ async def update_profile(user_id: str, **kwargs) -> dict:
                 values = []
                 index = 2
                 for column, value in filtered_updates.items():
-                    if column == "health_anchors":
+                    if column in {"health_anchors", "playbook"}:
                         set_clauses.append(f"{column} = ${index}::jsonb")
                     else:
                         set_clauses.append(f"{column} = ${index}")
@@ -113,14 +134,18 @@ async def update_profile(user_id: str, **kwargs) -> dict:
             "bedtime": filtered_updates.get("bedtime"),
             "timezone": filtered_updates.get("timezone"),
             "health_anchors": filtered_updates.get("health_anchors", []),
+            "onboarding_status": filtered_updates.get("onboarding_status", "pending"),
+            "onboarding_completed_at": filtered_updates.get("onboarding_completed_at"),
+            "playbook": filtered_updates.get("playbook", {}),
             "created_at": now,
             "updated_at": now,
         }
         row = await conn.fetchrow(
             """
             INSERT INTO users (
-                user_id, wake_time, bedtime, timezone, health_anchors, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                user_id, wake_time, bedtime, timezone, health_anchors, onboarding_status,
+                onboarding_completed_at, playbook, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, $10)
             RETURNING *
             """,
             insert_payload["user_id"],
@@ -128,6 +153,9 @@ async def update_profile(user_id: str, **kwargs) -> dict:
             insert_payload["bedtime"],
             insert_payload["timezone"],
             insert_payload["health_anchors"],
+            insert_payload["onboarding_status"],
+            insert_payload["onboarding_completed_at"],
+            insert_payload["playbook"],
             insert_payload["created_at"],
             insert_payload["updated_at"],
         )

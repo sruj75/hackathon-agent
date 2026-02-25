@@ -93,6 +93,9 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # Application name constant
 APP_NAME = "intentive-coach"
+COMPOSIO_INTEGRATION_APPS = ("googlecalendar", "googletasks")
+ONBOARDING_STATUS_PENDING = "pending"
+ONBOARDING_STATUS_COMPLETED = "completed"
 
 # ========================================
 # FastAPI App Setup
@@ -137,14 +140,6 @@ def _get_composio_client() -> Composio:
             detail="COMPOSIO_API_KEY is not configured",
         )
     return Composio(api_key=api_key)
-
-
-def _composio_apps() -> list[str]:
-    raw_apps = os.getenv(
-        "COMPOSIO_REQUIRED_APPS",
-        "googlecalendar,googletasks",
-    )
-    return [name.strip() for name in raw_apps.split(",") if name.strip()]
 
 
 def _is_live_transient_error(error: Exception) -> bool:
@@ -253,6 +248,29 @@ def _profile_is_complete(profile: dict | None) -> bool:
     return valid_scheduler_profile
 
 
+def _normalize_onboarding_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    if status == ONBOARDING_STATUS_COMPLETED:
+        return ONBOARDING_STATUS_COMPLETED
+    return ONBOARDING_STATUS_PENDING
+
+
+def _is_onboarding_complete(profile: dict | None) -> bool:
+    if not profile:
+        return False
+
+    onboarding_status = _normalize_onboarding_status(profile.get("onboarding_status"))
+    if onboarding_status == ONBOARDING_STATUS_COMPLETED:
+        return True
+
+    if profile.get("onboarding_completed_at") is not None:
+        return True
+
+    # Backward compatibility: users onboarded before onboarding_status existed
+    # should continue entering the main assistant when their profile is complete.
+    return _profile_is_complete(profile)
+
+
 def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str:
     """
     Select conversation session ID.
@@ -298,6 +316,33 @@ def _require_timezone(timezone_name: str | None, *, context: str) -> str:
             },
         )
     return normalized
+
+
+def _validate_onboarding_complete_payload(payload: dict) -> tuple[dict, list[str]]:
+    body = payload if isinstance(payload, dict) else {}
+    errors: list[str] = []
+    sanitized: dict[str, object] = {}
+
+    has_preferences = any(
+        key in body for key in ("wake_time", "bedtime", "timezone", "health_anchors")
+    )
+    if has_preferences:
+        preference_updates, preference_errors = _validate_preferences_payload(body)
+        if preference_errors:
+            errors.extend(preference_errors)
+        else:
+            sanitized.update(preference_updates)
+
+    if "playbook" in body:
+        playbook = body.get("playbook")
+        if playbook is None:
+            sanitized["playbook"] = {}
+        elif isinstance(playbook, dict):
+            sanitized["playbook"] = playbook
+        else:
+            errors.append("playbook must be a JSON object")
+
+    return sanitized, errors
 
 
 def _next_morning_wake_datetime(
@@ -516,6 +561,48 @@ async def _reconcile_missing_cron_jobs() -> None:
             logger.warning(f"[cron-reconcile] Failed for event {_event_field(event, 'id')}: {e}")
 
 
+async def _get_composio_status_payload(user_id: str) -> dict:
+    entity = _get_composio_client().get_entity(user_id)
+    connections = entity.get_connections()
+
+    statuses: list[dict] = []
+    for app_name in COMPOSIO_INTEGRATION_APPS:
+        app_connections = [
+            conn
+            for conn in connections
+            if str(getattr(conn, "appName", "")).lower() == app_name.lower()
+        ]
+        active_conn = next(
+            (
+                conn
+                for conn in app_connections
+                if str(getattr(conn, "status", "")).upper() == "ACTIVE"
+            ),
+            None,
+        )
+        statuses.append(
+            {
+                "app": app_name,
+                "connected": active_conn is not None,
+                "status": str(getattr(active_conn, "status", "NOT_CONNECTED")),
+                "connected_account_id": getattr(active_conn, "id", None),
+            }
+        )
+
+    return {
+        "apps": statuses,
+        "all_connected": all(item["connected"] for item in statuses),
+    }
+
+
+def _bootstrap_route_hint(*, all_connected: bool, profile: dict | None) -> str:
+    if not all_connected:
+        return "connect_flow"
+    if _is_onboarding_complete(profile):
+        return "assistant"
+    return "onboarding_placeholder"
+
+
 # ========================================
 # Endpoints
 # ========================================
@@ -612,14 +699,19 @@ async def create_composio_connect_link(
     payload: dict,
     current_user: AuthUser = Depends(get_authenticated_user),
 ):
-    redirect_url_raw = payload.get("redirect_url")
-    requested_app = payload.get("app")
-    redirect_url = redirect_url_raw if isinstance(redirect_url_raw, str) and redirect_url_raw.strip() else None
-    apps = [requested_app] if isinstance(requested_app, str) and requested_app.strip() else _composio_apps()
+    body = payload if isinstance(payload, dict) else {}
+    if "app" in body:
+        raise HTTPException(status_code=400, detail="app selection is not supported")
+    redirect_url_raw = body.get("redirect_url")
+    redirect_url = (
+        redirect_url_raw
+        if isinstance(redirect_url_raw, str) and redirect_url_raw.strip()
+        else None
+    )
     try:
         entity = _get_composio_client().get_entity(current_user.user_id)
         links: list[dict] = []
-        for app_name in apps:
+        for app_name in COMPOSIO_INTEGRATION_APPS:
             request = entity.initiate_connection(
                 app_name=app_name,
                 redirect_url=redirect_url,
@@ -647,44 +739,127 @@ async def create_composio_connect_link(
 @app.get("/api/integrations/composio/status")
 async def get_composio_status(current_user: AuthUser = Depends(get_authenticated_user)):
     try:
-        entity = _get_composio_client().get_entity(current_user.user_id)
-        connections = entity.get_connections()
+        composio_payload = await _get_composio_status_payload(current_user.user_id)
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Failed to read Composio connection status")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    required_apps = _composio_apps()
-    statuses: list[dict] = []
-    for app_name in required_apps:
-        app_connections = [
-            conn
-            for conn in connections
-            if str(getattr(conn, "appName", "")).lower() == app_name.lower()
-        ]
-        active_conn = next(
-            (
-                conn
-                for conn in app_connections
-                if str(getattr(conn, "status", "")).upper() == "ACTIVE"
-            ),
-            None,
-        )
-        statuses.append(
-            {
-                "app": app_name,
-                "connected": active_conn is not None,
-                "status": str(getattr(active_conn, "status", "NOT_CONNECTED")),
-                "connected_account_id": getattr(active_conn, "id", None),
-            }
-        )
-
     return {
         "status": "ok",
         "user_id": current_user.user_id,
-        "apps": statuses,
-        "all_connected": all(item["connected"] for item in statuses),
+        "apps": composio_payload["apps"],
+        "all_connected": composio_payload["all_connected"],
+    }
+
+
+# ========================================
+# Onboarding Endpoints
+# ========================================
+
+@app.get("/api/onboarding/bootstrap")
+async def get_onboarding_bootstrap(
+    current_user: AuthUser = Depends(get_authenticated_user),
+):
+    user_id = current_user.user_id
+    profile = await user_repo.get_profile(user_id)
+    profile_exists = profile is not None
+
+    # Enforce profile invariant for authenticated users.
+    if profile is None:
+        profile = await user_repo.update_profile(
+            user_id,
+            onboarding_status=ONBOARDING_STATUS_PENDING,
+        )
+
+    try:
+        composio_payload = await _get_composio_status_payload(user_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to read onboarding bootstrap connection status")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    onboarding_completed = _is_onboarding_complete(profile)
+    onboarding_status = (
+        ONBOARDING_STATUS_COMPLETED
+        if onboarding_completed
+        else ONBOARDING_STATUS_PENDING
+    )
+    route_hint = _bootstrap_route_hint(
+        all_connected=composio_payload["all_connected"],
+        profile=profile,
+    )
+
+    completed_at = _as_datetime(profile.get("onboarding_completed_at"))
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "apps": composio_payload["apps"],
+        "all_connected": composio_payload["all_connected"],
+        "onboarding_status": onboarding_status,
+        "onboarding_completed_at": completed_at.isoformat() if completed_at else None,
+        "route_hint": route_hint,
+        "profile_exists": profile_exists,
+    }
+
+
+@app.post("/api/onboarding/complete")
+async def complete_onboarding(
+    payload: dict,
+    current_user: AuthUser = Depends(get_authenticated_user),
+):
+    user_id = current_user.user_id
+    body = payload if isinstance(payload, dict) else {}
+    sanitized, errors = _validate_onboarding_complete_payload(body)
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    completion_time = datetime.now(timezone.utc)
+    sanitized["onboarding_status"] = ONBOARDING_STATUS_COMPLETED
+    sanitized["onboarding_completed_at"] = completion_time
+    updated_profile = await user_repo.update_profile(user_id, **sanitized)
+
+    scheduler_error = None
+    if _profile_is_complete(updated_profile):
+        try:
+            await _ensure_morning_wake_for_user(updated_profile)
+        except Exception as exc:
+            scheduler_error = str(exc)
+            logger.warning(
+                "[onboarding] Failed to resync morning wake for %s: %s",
+                user_id,
+                exc,
+            )
+
+    try:
+        composio_payload = await _get_composio_status_payload(user_id)
+    except Exception:
+        composio_payload = {"apps": [], "all_connected": False}
+
+    route_hint = _bootstrap_route_hint(
+        all_connected=composio_payload["all_connected"],
+        profile=updated_profile,
+    )
+    return {
+        "status": "ok" if scheduler_error is None else "partial_success",
+        "user_id": user_id,
+        "onboarding_status": ONBOARDING_STATUS_COMPLETED,
+        "onboarding_completed_at": completion_time.isoformat(),
+        "preferences": {
+            "wake_time": updated_profile.get("wake_time"),
+            "bedtime": updated_profile.get("bedtime"),
+            "timezone": updated_profile.get("timezone"),
+            "health_anchors": _normalize_health_anchors(
+                updated_profile.get("health_anchors")
+            ),
+        },
+        "route_hint": route_hint,
+        "scheduler": {
+            "resynced": scheduler_error is None,
+            "error": scheduler_error,
+        },
     }
 
 

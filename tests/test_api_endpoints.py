@@ -1,5 +1,6 @@
 """API endpoint tests for current backend."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -308,3 +309,281 @@ async def test_put_preferences_does_not_overwrite_anchors_when_omitted(
     update_args = update_profile_mock.await_args
     assert update_args.args[0] == "user_test"
     assert "health_anchors" not in update_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_composio_connect_link_returns_all_integration_apps(api_client, monkeypatch):
+    class _FakeEntity:
+        def __init__(self):
+            self.calls = []
+
+        def initiate_connection(self, app_name, redirect_url):
+            self.calls.append((app_name, redirect_url))
+            return SimpleNamespace(
+                connectionStatus="INITIATED",
+                connectedAccountId=f"conn_{app_name}",
+                redirectUrl=redirect_url,
+            )
+
+    class _FakeClient:
+        def __init__(self, entity):
+            self._entity = entity
+
+        def get_entity(self, _user_id):
+            return self._entity
+
+    fake_entity = _FakeEntity()
+    monkeypatch.setenv("COMPOSIO_REQUIRED_APPS", "not-used")
+    monkeypatch.setattr(main, "_get_composio_client", lambda: _FakeClient(fake_entity))
+
+    response = await api_client.post(
+        "/api/integrations/composio/connect-link",
+        json={"redirect_url": "https://example.com/callback"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["app"] for item in body["links"]] == list(main.COMPOSIO_INTEGRATION_APPS)
+    assert fake_entity.calls == [
+        ("googlecalendar", "https://example.com/callback"),
+        ("googletasks", "https://example.com/callback"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_composio_connect_link_rejects_app_selection(api_client, monkeypatch):
+    def _unexpected_client_call():
+        raise AssertionError("Composio client should not be used when app is provided")
+
+    monkeypatch.setattr(main, "_get_composio_client", _unexpected_client_call)
+
+    response = await api_client.post(
+        "/api/integrations/composio/connect-link",
+        json={"app": "googlecalendar"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "app selection is not supported"
+
+
+@pytest.mark.asyncio
+async def test_composio_status_reports_all_connected(api_client, monkeypatch):
+    class _FakeEntity:
+        def get_connections(self):
+            return [
+                SimpleNamespace(appName="googlecalendar", status="ACTIVE", id="calendar_1"),
+                SimpleNamespace(appName="googletasks", status="ACTIVE", id="tasks_1"),
+            ]
+
+    class _FakeClient:
+        def get_entity(self, _user_id):
+            return _FakeEntity()
+
+    monkeypatch.setattr(main, "_get_composio_client", lambda: _FakeClient())
+
+    response = await api_client.get("/api/integrations/composio/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["app"] for item in body["apps"]] == list(main.COMPOSIO_INTEGRATION_APPS)
+    assert body["all_connected"] is True
+    assert all(item["connected"] for item in body["apps"])
+
+
+@pytest.mark.asyncio
+async def test_composio_status_reports_missing_integration(api_client, monkeypatch):
+    class _FakeEntity:
+        def get_connections(self):
+            return [
+                SimpleNamespace(appName="googlecalendar", status="ACTIVE", id="calendar_1"),
+            ]
+
+    class _FakeClient:
+        def get_entity(self, _user_id):
+            return _FakeEntity()
+
+    monkeypatch.setattr(main, "_get_composio_client", lambda: _FakeClient())
+
+    response = await api_client.get("/api/integrations/composio/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["all_connected"] is False
+    assert [item["app"] for item in body["apps"]] == list(main.COMPOSIO_INTEGRATION_APPS)
+    assert body["apps"][0]["connected"] is True
+    assert body["apps"][1]["connected"] is False
+    assert body["apps"][1]["status"] == "NOT_CONNECTED"
+    assert body["apps"][1]["connected_account_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_onboarding_bootstrap_routes_to_assistant_when_complete(
+    api_client, monkeypatch
+):
+    profile = {
+        "user_id": "user_test",
+        "wake_time": "07:00",
+        "bedtime": "22:30",
+        "timezone": "UTC",
+        "onboarding_status": "completed",
+        "onboarding_completed_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    class _FakeEntity:
+        def get_connections(self):
+            return [
+                SimpleNamespace(appName="googlecalendar", status="ACTIVE", id="calendar_1"),
+                SimpleNamespace(appName="googletasks", status="ACTIVE", id="tasks_1"),
+            ]
+
+    class _FakeClient:
+        def get_entity(self, _user_id):
+            return _FakeEntity()
+
+    monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=profile))
+    monkeypatch.setattr(main, "_get_composio_client", lambda: _FakeClient())
+
+    response = await api_client.get("/api/onboarding/bootstrap")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["all_connected"] is True
+    assert body["onboarding_status"] == "completed"
+    assert body["route_hint"] == "assistant"
+    assert body["profile_exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_onboarding_bootstrap_creates_pending_profile_and_connect_flow(
+    api_client, monkeypatch
+):
+    update_profile_mock = AsyncMock(
+        return_value={
+            "user_id": "user_test",
+            "wake_time": None,
+            "bedtime": None,
+            "timezone": None,
+            "onboarding_status": "pending",
+            "onboarding_completed_at": None,
+        }
+    )
+
+    class _FakeEntity:
+        def get_connections(self):
+            return []
+
+    class _FakeClient:
+        def get_entity(self, _user_id):
+            return _FakeEntity()
+
+    monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
+    monkeypatch.setattr(main, "_get_composio_client", lambda: _FakeClient())
+
+    response = await api_client.get("/api/onboarding/bootstrap")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["profile_exists"] is False
+    assert body["all_connected"] is False
+    assert body["route_hint"] == "connect_flow"
+    assert body["onboarding_status"] == "pending"
+    update_profile_mock.assert_awaited_once_with(
+        "user_test",
+        onboarding_status=main.ONBOARDING_STATUS_PENDING,
+    )
+
+
+@pytest.mark.asyncio
+async def test_onboarding_bootstrap_routes_to_placeholder_when_pending(
+    api_client, monkeypatch
+):
+    profile = {
+        "user_id": "user_test",
+        "wake_time": None,
+        "bedtime": None,
+        "timezone": None,
+        "onboarding_status": "pending",
+        "onboarding_completed_at": None,
+    }
+
+    class _FakeEntity:
+        def get_connections(self):
+            return [
+                SimpleNamespace(appName="googlecalendar", status="ACTIVE", id="calendar_1"),
+                SimpleNamespace(appName="googletasks", status="ACTIVE", id="tasks_1"),
+            ]
+
+    class _FakeClient:
+        def get_entity(self, _user_id):
+            return _FakeEntity()
+
+    monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=profile))
+    monkeypatch.setattr(main, "_get_composio_client", lambda: _FakeClient())
+
+    response = await api_client.get("/api/onboarding/bootstrap")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["all_connected"] is True
+    assert body["route_hint"] == "onboarding_placeholder"
+    assert body["onboarding_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_complete_onboarding_marks_completed_and_resyncs(api_client, monkeypatch):
+    completion_profile = {
+        "user_id": "user_test",
+        "wake_time": "07:30",
+        "bedtime": "22:15",
+        "timezone": "America/New_York",
+        "health_anchors": ["sleep"],
+        "onboarding_status": "completed",
+        "onboarding_completed_at": "2026-01-01T00:00:00+00:00",
+    }
+    update_profile_mock = AsyncMock(return_value=completion_profile)
+    resync_mock = AsyncMock(return_value=None)
+    composio_status_mock = AsyncMock(
+        return_value={"apps": [], "all_connected": True}
+    )
+
+    monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
+    monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
+    monkeypatch.setattr(main, "_get_composio_status_payload", composio_status_mock)
+
+    response = await api_client.post(
+        "/api/onboarding/complete",
+        json={
+            "wake_time": "07:30",
+            "bedtime": "22:15",
+            "timezone": "America/New_York",
+            "health_anchors": ["sleep"],
+            "playbook": {"cadence": "daily"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["onboarding_status"] == "completed"
+    assert body["route_hint"] == "assistant"
+    update_profile_mock.assert_awaited_once()
+    kwargs = update_profile_mock.await_args.kwargs
+    assert kwargs["onboarding_status"] == "completed"
+    assert kwargs["playbook"] == {"cadence": "daily"}
+    assert "onboarding_completed_at" in kwargs
+    resync_mock.assert_awaited_once_with(completion_profile)
+
+
+@pytest.mark.asyncio
+async def test_complete_onboarding_validates_playbook(api_client):
+    response = await api_client.post(
+        "/api/onboarding/complete",
+        json={
+            "playbook": "not-a-json-object",
+        },
+    )
+
+    assert response.status_code == 400
+    errors = response.json()["detail"]["errors"]
+    assert "playbook must be a JSON object" in errors
