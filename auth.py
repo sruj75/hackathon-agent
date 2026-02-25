@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _JWKS_CACHE: dict[str, Any] = {"expires_at": 0.0, "keys": {}}
 _JWKS_TTL_SECONDS = 300
+_ALLOWED_JWT_ALGORITHMS = frozenset({"ES256", "EdDSA"})
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,28 @@ def _expected_audience() -> str:
     return os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
 
 
+def _is_allowed_algorithm(alg: str) -> bool:
+    return alg in _ALLOWED_JWT_ALGORITHMS
+
+
+def _key_from_jwk(alg: str, jwk: dict[str, Any]) -> Any:
+    algorithm_impl = algorithms.get_default_algorithms().get(alg)
+    if algorithm_impl is None:
+        logger.warning("Unsupported JWT algorithm handler: alg=%s", alg)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unsupported JWT algorithm configuration",
+        )
+    try:
+        return algorithm_impl.from_jwk(json.dumps(jwk))
+    except (jwt_exceptions.InvalidKeyError, ValueError, TypeError) as exc:
+        logger.warning("Invalid JWK for alg=%s: %s", alg, exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token signing key",
+        ) from exc
+
+
 async def _get_jwks_by_kid(kid: str) -> dict[str, Any]:
     now = time.time()
     cached_keys: dict[str, Any] = _JWKS_CACHE["keys"]
@@ -62,13 +85,13 @@ async def _get_jwks_by_kid(kid: str) -> dict[str, Any]:
             response.raise_for_status()
             payload = response.json()
         except httpx.HTTPStatusError as exc:
-            logger.error("JWKS fetch failed with status %s", exc.response.status_code)
+            logger.warning("JWKS fetch failed with status %s", exc.response.status_code)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unable to verify token",
             ) from exc
         except httpx.RequestError as exc:
-            logger.error("JWKS fetch request failed: %s", exc)
+            logger.warning("JWKS fetch request failed: %s", exc)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unable to verify token",
@@ -84,6 +107,7 @@ async def _get_jwks_by_kid(kid: str) -> dict[str, Any]:
     _JWKS_CACHE["expires_at"] = now + _JWKS_TTL_SECONDS
 
     if kid not in keys_by_kid:
+        logger.info("Unknown JWT key id: kid=%s", kid)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unknown JWT key id",
@@ -102,6 +126,7 @@ async def verify_supabase_jwt(access_token: str) -> AuthUser:
     try:
         header = jwt.get_unverified_header(access_token)
     except jwt_exceptions.PyJWTError as exc:
+        logger.info("Invalid JWT header: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid JWT header",
@@ -110,26 +135,50 @@ async def verify_supabase_jwt(access_token: str) -> AuthUser:
     kid = header.get("kid")
     alg = header.get("alg")
     if not kid or not alg:
+        logger.info("Malformed JWT header: missing kid or alg")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Malformed JWT header",
         )
 
     if alg.startswith("HS"):
+        logger.warning("Rejected unsupported symmetric JWT algorithm: alg=%s", alg)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unsupported JWT algorithm configuration",
+        )
+
+    if not _is_allowed_algorithm(alg):
+        logger.warning("Rejected non-allowlisted JWT algorithm: alg=%s", alg)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unsupported JWT algorithm configuration",
         )
 
     jwk = await _get_jwks_by_kid(kid)
-    try:
-        key = algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
-    except (jwt_exceptions.InvalidKeyError, ValueError) as exc:
-        logger.warning("Invalid JWK: %s", exc)
+
+    jwk_use = jwk.get("use")
+    if jwk_use is not None and jwk_use != "sig":
+        logger.warning("Invalid JWK use for kid=%s: use=%s", kid, jwk_use)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token signing key",
-        ) from exc
+        )
+
+    jwk_alg = jwk.get("alg")
+    if jwk_alg is not None and jwk_alg != alg:
+        logger.warning(
+            "JWT/JWK algorithm mismatch for kid=%s: header_alg=%s jwk_alg=%s",
+            kid,
+            alg,
+            jwk_alg,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token signing key",
+        )
+
+    key = _key_from_jwk(alg=alg, jwk=jwk)
 
     try:
         claims = jwt.decode(
@@ -140,7 +189,7 @@ async def verify_supabase_jwt(access_token: str) -> AuthUser:
             issuer=_issuer(),
         )
     except jwt_exceptions.PyJWTError as exc:
-        logger.warning("JWT verification failed: %s", exc)
+        logger.info("JWT verification failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired access token",
