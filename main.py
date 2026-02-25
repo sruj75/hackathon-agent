@@ -14,7 +14,7 @@ import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from composio import Composio
@@ -30,9 +30,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Import agent after loading env
-from voice_agent.agent import (  # noqa: E402
-    conversation_agent as agent,
-)
+from voice_agent.agent import conversation_agent as main_agent  # noqa: E402
+from voice_agent.onboarding_agent import onboarding_agent  # noqa: E402
 from voice_agent.render_ui_tools import set_ui_event_queue  # noqa: E402
 
 from google.adk.runners import Runner
@@ -48,6 +47,7 @@ from agent_runtime import AgentRuntime
 import cron_service
 from db import close_pool
 from notification_service import send_push_notification
+from onboarding_service import complete_onboarding_for_user
 
 # Configure logging
 logging.basicConfig(
@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 HHMM_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 SESSION_ID_PATTERN = re.compile(r"^session_(?P<user_id>.+)_(?P<date>\d{4}-\d{2}-\d{2})$")
+ONBOARDING_SESSION_ID_PATTERN = re.compile(r"^session_onboarding_(?P<user_id>.+)$")
 
 
 def _event_field(event: object, field: str, default=None):
@@ -129,7 +130,18 @@ app.add_middleware(
 # Session and Runner setup
 # Session and Runner setup
 session_manager = ADKSessionManager()
-runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_manager.service)
+main_runner = Runner(
+    app_name=APP_NAME,
+    agent=main_agent,
+    session_service=session_manager.service,
+)
+onboarding_runner = Runner(
+    app_name=APP_NAME,
+    agent=onboarding_agent,
+    session_service=session_manager.service,
+)
+# Backward compatibility for existing tests/modules still referencing `main.runner`.
+runner = main_runner
 
 
 def _get_composio_client() -> Composio:
@@ -271,6 +283,23 @@ def _is_onboarding_complete(profile: dict | None) -> bool:
     return _profile_is_complete(profile)
 
 
+def _get_onboarding_session_id(user_id: str) -> str:
+    return f"session_onboarding_{user_id}"
+
+
+def _select_onboarding_session_id(user_id: str, requested_session_id: str | None) -> str:
+    expected = _get_onboarding_session_id(user_id)
+    if not requested_session_id:
+        return expected
+
+    match = ONBOARDING_SESSION_ID_PATTERN.match(requested_session_id)
+    if not match:
+        return expected
+    if match.group("user_id") != user_id:
+        return expected
+    return requested_session_id
+
+
 def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str:
     """
     Select conversation session ID.
@@ -290,6 +319,12 @@ def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str
         return fallback_session_id
 
     return requested_session_id
+
+
+def _use_onboarding_mode(trigger_type: object, profile: dict | None) -> bool:
+    return str(trigger_type or "").strip().lower() == "onboarding" and not _is_onboarding_complete(
+        profile
+    )
 
 
 def _normalize_timezone(timezone_name: str | None) -> str | None:
@@ -322,16 +357,29 @@ def _validate_onboarding_complete_payload(payload: dict) -> tuple[dict, list[str
     body = payload if isinstance(payload, dict) else {}
     errors: list[str] = []
     sanitized: dict[str, object] = {}
+    wake_time = body.get("wake_time")
+    bedtime = body.get("bedtime")
+    timezone_name = body.get("timezone")
+    health_anchors = _normalize_health_anchors(body.get("health_anchors"))
 
-    has_preferences = any(
-        key in body for key in ("wake_time", "bedtime", "timezone", "health_anchors")
-    )
-    if has_preferences:
-        preference_updates, preference_errors = _validate_preferences_payload(body)
-        if preference_errors:
-            errors.extend(preference_errors)
+    if not isinstance(wake_time, str) or not _is_valid_hhmm(wake_time):
+        errors.append("wake_time must be HH:MM in 24-hour format")
+    else:
+        sanitized["wake_time"] = wake_time
+
+    if not isinstance(bedtime, str) or not _is_valid_hhmm(bedtime):
+        errors.append("bedtime must be HH:MM in 24-hour format")
+    else:
+        sanitized["bedtime"] = bedtime
+
+    if timezone_name is not None:
+        if not isinstance(timezone_name, str) or not _normalize_timezone(timezone_name):
+            errors.append("timezone must be a valid IANA timezone")
         else:
-            sanitized.update(preference_updates)
+            sanitized["timezone"] = timezone_name
+
+    if "health_anchors" in body:
+        sanitized["health_anchors"] = health_anchors
 
     if "playbook" in body:
         playbook = body.get("playbook")
@@ -603,6 +651,66 @@ def _bootstrap_route_hint(*, all_connected: bool, profile: dict | None) -> str:
     return "onboarding_placeholder"
 
 
+async def _complete_onboarding_workflow(
+    *,
+    user_id: str,
+    wake_time: str,
+    bedtime: str,
+    timezone_name: str | None,
+    playbook: dict[str, Any] | None,
+    health_anchors: list[str] | None,
+) -> dict[str, Any]:
+    updated_profile, completion_time = await complete_onboarding_for_user(
+        user_id,
+        wake_time=wake_time,
+        bedtime=bedtime,
+        timezone_name=timezone_name,
+        playbook=playbook,
+        health_anchors=health_anchors,
+    )
+
+    scheduler_error = None
+    if _profile_is_complete(updated_profile):
+        try:
+            await _ensure_morning_wake_for_user(updated_profile)
+        except Exception as exc:
+            scheduler_error = str(exc)
+            logger.warning(
+                "[onboarding] Failed to resync morning wake for %s: %s",
+                user_id,
+                exc,
+            )
+
+    try:
+        composio_payload = await _get_composio_status_payload(user_id)
+    except Exception:
+        composio_payload = {"apps": [], "all_connected": False}
+
+    route_hint = _bootstrap_route_hint(
+        all_connected=composio_payload["all_connected"],
+        profile=updated_profile,
+    )
+    return {
+        "status": "ok" if scheduler_error is None else "partial_success",
+        "user_id": user_id,
+        "onboarding_status": ONBOARDING_STATUS_COMPLETED,
+        "onboarding_completed_at": completion_time.isoformat(),
+        "preferences": {
+            "wake_time": updated_profile.get("wake_time"),
+            "bedtime": updated_profile.get("bedtime"),
+            "timezone": updated_profile.get("timezone"),
+            "health_anchors": _normalize_health_anchors(
+                updated_profile.get("health_anchors")
+            ),
+        },
+        "route_hint": route_hint,
+        "scheduler": {
+            "resynced": scheduler_error is None,
+            "error": scheduler_error,
+        },
+    }
+
+
 # ========================================
 # Endpoints
 # ========================================
@@ -610,7 +718,7 @@ def _bootstrap_route_hint(*, all_connected: bool, profile: dict | None) -> str:
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    return {"status": "ok", "app": APP_NAME, "agent": agent.name}
+    return {"status": "ok", "app": APP_NAME, "agent": main_agent.name}
 
 
 @app.get("/health")
@@ -801,6 +909,7 @@ async def get_onboarding_bootstrap(
         "onboarding_status": onboarding_status,
         "onboarding_completed_at": completed_at.isoformat() if completed_at else None,
         "route_hint": route_hint,
+        "onboarding_session_id": _get_onboarding_session_id(user_id),
         "profile_exists": profile_exists,
     }
 
@@ -816,51 +925,24 @@ async def complete_onboarding(
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
 
-    completion_time = datetime.now(timezone.utc)
-    sanitized["onboarding_status"] = ONBOARDING_STATUS_COMPLETED
-    sanitized["onboarding_completed_at"] = completion_time
-    updated_profile = await user_repo.update_profile(user_id, **sanitized)
-
-    scheduler_error = None
-    if _profile_is_complete(updated_profile):
-        try:
-            await _ensure_morning_wake_for_user(updated_profile)
-        except Exception as exc:
-            scheduler_error = str(exc)
-            logger.warning(
-                "[onboarding] Failed to resync morning wake for %s: %s",
-                user_id,
-                exc,
-            )
-
     try:
-        composio_payload = await _get_composio_status_payload(user_id)
-    except Exception:
-        composio_payload = {"apps": [], "all_connected": False}
-
-    route_hint = _bootstrap_route_hint(
-        all_connected=composio_payload["all_connected"],
-        profile=updated_profile,
-    )
-    return {
-        "status": "ok" if scheduler_error is None else "partial_success",
-        "user_id": user_id,
-        "onboarding_status": ONBOARDING_STATUS_COMPLETED,
-        "onboarding_completed_at": completion_time.isoformat(),
-        "preferences": {
-            "wake_time": updated_profile.get("wake_time"),
-            "bedtime": updated_profile.get("bedtime"),
-            "timezone": updated_profile.get("timezone"),
-            "health_anchors": _normalize_health_anchors(
-                updated_profile.get("health_anchors")
+        result = await _complete_onboarding_workflow(
+            user_id=user_id,
+            wake_time=str(sanitized["wake_time"]),
+            bedtime=str(sanitized["bedtime"]),
+            timezone_name=(
+                str(sanitized["timezone"]) if "timezone" in sanitized else None
             ),
-        },
-        "route_hint": route_hint,
-        "scheduler": {
-            "resynced": scheduler_error is None,
-            "error": scheduler_error,
-        },
-    }
+            playbook=sanitized.get("playbook")
+            if isinstance(sanitized.get("playbook"), dict)
+            else None,
+            health_anchors=sanitized.get("health_anchors")
+            if isinstance(sanitized.get("health_anchors"), list)
+            else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"errors": [str(exc)]}) from exc
+    return result
 
 
 # ========================================
@@ -1129,18 +1211,31 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             return
 
         user_id = auth_user.user_id
+        try:
+            profile = await user_repo.get_profile(user_id)
+        except Exception as profile_error:
+            logger.warning("[WS-INIT] Failed to load profile for %s: %s", user_id, profile_error)
+            profile = None
+
         resume_session_id = init_message.get("resume_session_id")
         requested_session_id = (
             resume_session_id
             if isinstance(resume_session_id, str) and resume_session_id.strip()
             else session_id
         )
-        unified_session_id = _select_ws_session_id(user_id, requested_session_id)
+        trigger_type = init_message.get("trigger_type")
+        onboarding_mode = _use_onboarding_mode(trigger_type, profile)
+
+        if onboarding_mode:
+            unified_session_id = _select_onboarding_session_id(user_id, requested_session_id)
+        else:
+            unified_session_id = _select_ws_session_id(user_id, requested_session_id)
 
         logger.info(
-            "[WS-INIT] Authenticated websocket user=%s, session=%s",
+            "[WS-INIT] Authenticated websocket user=%s, session=%s, onboarding_mode=%s",
             user_id,
             unified_session_id,
+            onboarding_mode,
         )
 
         current_user_id.set(user_id)
@@ -1152,15 +1247,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             session_id=unified_session_id,
         )
 
-        try:
-            profile = await user_repo.get_profile(user_id)
-        except Exception as profile_error:
-            logger.warning("[WS-INIT] Failed to load profile for %s: %s", user_id, profile_error)
-            profile = None
-
-        trigger_type = init_message.get("trigger_type")
-        if isinstance(trigger_type, str) and trigger_type:
-            session.state["trigger_type"] = trigger_type
+        effective_trigger_type = "onboarding" if onboarding_mode else None
+        if isinstance(trigger_type, str) and trigger_type and not onboarding_mode:
+            effective_trigger_type = trigger_type
+        if effective_trigger_type:
+            session.state["trigger_type"] = effective_trigger_type
+        session.state["agent_mode"] = "onboarding" if onboarding_mode else "main"
 
         client_timezone = _normalize_timezone(init_message.get("timezone"))
         profile_timezone = _normalize_timezone((profile or {}).get("timezone"))
@@ -1177,11 +1269,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     profile_update_error,
                 )
 
+        activation_prompt = (
+            "Start onboarding: briefly greet the user and ask the first onboarding question."
+            if onboarding_mode
+            else "Start with a brief greeting, then ask how you can help."
+        )
         activation_message = types.Content(
             role="user",
-            parts=[
-                types.Part(text="Start with a brief greeting, then ask how you can help."),
-            ],
+            parts=[types.Part(text=activation_prompt)],
         )
         live_request_queue.send_content(activation_message)
         logger.info("[WS-INIT] Sent activation message")
@@ -1294,14 +1389,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             """Receives Events from run_live() and sends to WebSocket."""
             logger.debug("downstream_task started")
             max_retries = 2
-            model_name = str(agent.model)
+            selected_runner = onboarding_runner if onboarding_mode else main_runner
+            selected_agent = onboarding_agent if onboarding_mode else main_agent
+            model_name = str(selected_agent.model)
             logger.info("[LIVE] Attempting run_live with conversation model: %s", model_name)
 
             for attempt in range(1, max_retries + 1):
                 try:
                     assert user_id is not None
                     assert unified_session_id is not None
-                    async for event in runner.run_live(
+                    async for event in selected_runner.run_live(
                         user_id=user_id,
                         session_id=unified_session_id,
                         live_request_queue=live_request_queue,

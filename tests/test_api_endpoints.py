@@ -1,5 +1,6 @@
 """API endpoint tests for current backend."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -450,6 +451,7 @@ async def test_onboarding_bootstrap_routes_to_assistant_when_complete(
     assert body["all_connected"] is True
     assert body["onboarding_status"] == "completed"
     assert body["route_hint"] == "assistant"
+    assert body["onboarding_session_id"] == "session_onboarding_user_test"
     assert body["profile_exists"] is True
 
 
@@ -488,6 +490,7 @@ async def test_onboarding_bootstrap_creates_pending_profile_and_connect_flow(
     assert body["all_connected"] is False
     assert body["route_hint"] == "connect_flow"
     assert body["onboarding_status"] == "pending"
+    assert body["onboarding_session_id"] == "session_onboarding_user_test"
     update_profile_mock.assert_awaited_once_with(
         "user_test",
         onboarding_status=main.ONBOARDING_STATUS_PENDING,
@@ -528,6 +531,29 @@ async def test_onboarding_bootstrap_routes_to_placeholder_when_pending(
     assert body["all_connected"] is True
     assert body["route_hint"] == "onboarding_placeholder"
     assert body["onboarding_status"] == "pending"
+    assert body["onboarding_session_id"] == "session_onboarding_user_test"
+
+
+def test_onboarding_session_id_selection():
+    assert (
+        main._select_onboarding_session_id("user_test", None)
+        == "session_onboarding_user_test"
+    )
+    assert (
+        main._select_onboarding_session_id(
+            "user_test",
+            "session_onboarding_user_test",
+        )
+        == "session_onboarding_user_test"
+    )
+    # Wrong user should be forced to deterministic onboarding session id.
+    assert (
+        main._select_onboarding_session_id(
+            "user_test",
+            "session_onboarding_other_user",
+        )
+        == "session_onboarding_user_test"
+    )
 
 
 @pytest.mark.asyncio
@@ -541,13 +567,19 @@ async def test_complete_onboarding_marks_completed_and_resyncs(api_client, monke
         "onboarding_status": "completed",
         "onboarding_completed_at": "2026-01-01T00:00:00+00:00",
     }
-    update_profile_mock = AsyncMock(return_value=completion_profile)
+    complete_onboarding_for_user_mock = AsyncMock(
+        return_value=(completion_profile, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    )
     resync_mock = AsyncMock(return_value=None)
     composio_status_mock = AsyncMock(
         return_value={"apps": [], "all_connected": True}
     )
 
-    monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
+    monkeypatch.setattr(
+        main,
+        "complete_onboarding_for_user",
+        complete_onboarding_for_user_mock,
+    )
     monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
     monkeypatch.setattr(main, "_get_composio_status_payload", composio_status_mock)
 
@@ -567,11 +599,14 @@ async def test_complete_onboarding_marks_completed_and_resyncs(api_client, monke
     assert body["status"] == "ok"
     assert body["onboarding_status"] == "completed"
     assert body["route_hint"] == "assistant"
-    update_profile_mock.assert_awaited_once()
-    kwargs = update_profile_mock.await_args.kwargs
-    assert kwargs["onboarding_status"] == "completed"
-    assert kwargs["playbook"] == {"cadence": "daily"}
-    assert "onboarding_completed_at" in kwargs
+    complete_onboarding_for_user_mock.assert_awaited_once_with(
+        "user_test",
+        wake_time="07:30",
+        bedtime="22:15",
+        timezone_name="America/New_York",
+        playbook={"cadence": "daily"},
+        health_anchors=["sleep"],
+    )
     resync_mock.assert_awaited_once_with(completion_profile)
 
 
@@ -580,6 +615,8 @@ async def test_complete_onboarding_validates_playbook(api_client):
     response = await api_client.post(
         "/api/onboarding/complete",
         json={
+            "wake_time": "07:30",
+            "bedtime": "22:15",
             "playbook": "not-a-json-object",
         },
     )

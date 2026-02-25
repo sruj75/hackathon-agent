@@ -42,7 +42,18 @@ class FakeConnection:
         q = " ".join(query.split())
 
         if q.startswith("INSERT INTO users "):
-            user_id, wake_time, bedtime, tz, anchors, created_at, updated_at = args
+            (
+                user_id,
+                wake_time,
+                bedtime,
+                tz,
+                anchors,
+                onboarding_status,
+                onboarding_completed_at,
+                playbook,
+                created_at,
+                updated_at,
+            ) = args
             row = self._db["users"].get(user_id, {})
             merged = {
                 **row,
@@ -51,6 +62,9 @@ class FakeConnection:
                 "bedtime": bedtime,
                 "timezone": tz,
                 "health_anchors": deepcopy(anchors),
+                "onboarding_status": onboarding_status,
+                "onboarding_completed_at": onboarding_completed_at,
+                "playbook": deepcopy(playbook),
                 "created_at": row.get("created_at", created_at),
                 "updated_at": updated_at,
             }
