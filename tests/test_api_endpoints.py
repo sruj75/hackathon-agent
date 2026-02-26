@@ -529,7 +529,7 @@ async def test_onboarding_bootstrap_routes_to_placeholder_when_pending(
     assert response.status_code == 200
     body = response.json()
     assert body["all_connected"] is True
-    assert body["route_hint"] == "onboarding_placeholder"
+    assert body["route_hint"] == "onboarding"
     assert body["onboarding_status"] == "pending"
     assert body["onboarding_session_id"] == "session_onboarding_user_test"
 

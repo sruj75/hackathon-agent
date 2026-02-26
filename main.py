@@ -648,7 +648,7 @@ def _bootstrap_route_hint(*, all_connected: bool, profile: dict | None) -> str:
         return "connect_flow"
     if _is_onboarding_complete(profile):
         return "assistant"
-    return "onboarding_placeholder"
+    return "onboarding"
 
 
 async def _complete_onboarding_workflow(
