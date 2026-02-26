@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -54,6 +55,12 @@ class FakeConnection:
                 created_at,
                 updated_at,
             ) = args
+            anchors_value = (
+                json.loads(anchors) if isinstance(anchors, str) else deepcopy(anchors)
+            )
+            playbook_value = (
+                json.loads(playbook) if isinstance(playbook, str) else deepcopy(playbook)
+            )
             row = self._db["users"].get(user_id, {})
             merged = {
                 **row,
@@ -61,10 +68,10 @@ class FakeConnection:
                 "wake_time": wake_time,
                 "bedtime": bedtime,
                 "timezone": tz,
-                "health_anchors": deepcopy(anchors),
+                "health_anchors": anchors_value,
                 "onboarding_status": onboarding_status,
                 "onboarding_completed_at": onboarding_completed_at,
-                "playbook": deepcopy(playbook),
+                "playbook": playbook_value,
                 "created_at": row.get("created_at", created_at),
                 "updated_at": updated_at,
             }
@@ -244,8 +251,11 @@ class FakeConnection:
             assignments = [x.strip() for x in set_part.split(",")]
             for assignment in assignments:
                 col, ref = assignment.split(" = ")
-                idx = int(ref.replace("$", "")) - 1
-                row[col] = deepcopy(args[idx])
+                idx = int(ref.replace("$", "").replace("::jsonb", "")) - 1
+                value = args[idx]
+                if "::jsonb" in ref and isinstance(value, str):
+                    value = json.loads(value)
+                row[col] = deepcopy(value)
             return "UPDATE 1"
 
         if q.startswith("UPDATE events SET "):

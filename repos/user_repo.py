@@ -3,6 +3,7 @@ User repository implementation with Supabase Postgres.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -27,6 +28,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_jsonb_param(value: object) -> str:
+    """Serialize JSONB parameters for asyncpg."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
 async def create_profile(
     user_id: str,
     wake_time: str,
@@ -39,19 +47,6 @@ async def create_profile(
 ) -> dict:
     """Create a new user profile."""
     now = _utcnow()
-    profile_data = {
-        "user_id": user_id,
-        "wake_time": wake_time,
-        "bedtime": bedtime,
-        "timezone": timezone,
-        "health_anchors": health_anchors or [],
-        "onboarding_status": onboarding_status,
-        "onboarding_completed_at": onboarding_completed_at,
-        "playbook": playbook or {},
-        "created_at": now,
-        "updated_at": now,
-    }
-
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -75,10 +70,10 @@ async def create_profile(
             wake_time,
             bedtime,
             timezone,
-            health_anchors or [],
+            _as_jsonb_param(health_anchors or []),
             onboarding_status,
             onboarding_completed_at,
-            playbook or {},
+            _as_jsonb_param(playbook or {}),
             now,
             now,
         )
@@ -109,9 +104,10 @@ async def update_profile(user_id: str, **kwargs) -> dict:
                 for column, value in filtered_updates.items():
                     if column in {"health_anchors", "playbook"}:
                         set_clauses.append(f"{column} = ${index}::jsonb")
+                        values.append(_as_jsonb_param(value))
                     else:
                         set_clauses.append(f"{column} = ${index}")
-                    values.append(value)
+                        values.append(value)
                     index += 1
                 set_clauses.append(f"updated_at = ${index}")
                 values.append(now)
@@ -152,10 +148,10 @@ async def update_profile(user_id: str, **kwargs) -> dict:
             insert_payload["wake_time"],
             insert_payload["bedtime"],
             insert_payload["timezone"],
-            insert_payload["health_anchors"],
+            _as_jsonb_param(insert_payload["health_anchors"]),
             insert_payload["onboarding_status"],
             insert_payload["onboarding_completed_at"],
-            insert_payload["playbook"],
+            _as_jsonb_param(insert_payload["playbook"]),
             insert_payload["created_at"],
             insert_payload["updated_at"],
         )
