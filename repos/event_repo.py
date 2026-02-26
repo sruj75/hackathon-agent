@@ -4,6 +4,7 @@ Event repository implementation with Supabase Postgres.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 from typing import List, Optional, Sequence
 import uuid
@@ -26,6 +27,13 @@ _UPDATE_COLUMNS = {
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_jsonb_param(value: object) -> str:
+    """Serialize JSONB parameters for asyncpg."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
 
 
 async def create_event(
@@ -52,7 +60,7 @@ async def create_event(
             user_id,
             scheduled_time,
             event_type,
-            payload,
+            _as_jsonb_param(payload),
             False,
             cron_job_id,
             now,
@@ -127,9 +135,10 @@ async def update_event(event_id: str, **kwargs) -> bool:
     for column, value in update_data.items():
         if column == "payload":
             set_clauses.append(f"{column} = ${index}::jsonb")
+            values.append(_as_jsonb_param(value))
         else:
             set_clauses.append(f"{column} = ${index}")
-        values.append(value)
+            values.append(value)
         index += 1
 
     set_clauses.append(f"updated_at = ${index}")

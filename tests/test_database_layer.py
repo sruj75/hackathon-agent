@@ -108,13 +108,14 @@ class FakeConnection:
                 created_at,
                 updated_at,
             ) = args
+            state_value = json.loads(state) if isinstance(state, str) else deepcopy(state)
             row = self._db["sessions"].get(session_id, {})
             merged = {
                 **row,
                 "session_id": session_id,
                 "user_id": user_id,
                 "date": date,
-                "state": deepcopy(state),
+                "state": state_value,
                 "created_at": row.get("created_at", created_at),
                 "updated_at": updated_at,
             }
@@ -147,12 +148,15 @@ class FakeConnection:
                 created_at,
                 updated_at,
             ) = args
+            payload_value = (
+                json.loads(payload) if isinstance(payload, str) else deepcopy(payload)
+            )
             row = {
                 "id": event_id,
                 "user_id": user_id,
                 "scheduled_time": scheduled_time,
                 "event_type": event_type,
-                "payload": deepcopy(payload),
+                "payload": payload_value,
                 "executed": executed,
                 "cron_job_id": cron_job_id,
                 "created_at": created_at,

@@ -3,6 +3,7 @@ Session repository implementation with Supabase Postgres.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -11,6 +12,13 @@ from db import get_pool
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_jsonb_param(value: object) -> str:
+    """Serialize JSONB parameters for asyncpg."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
 
 
 async def save_session(
@@ -75,7 +83,7 @@ async def upsert_session(session_id: str, user_id: str, date: str, state: dict) 
             session_id,
             user_id,
             date,
-            state,
+            _as_jsonb_param(state),
             now,
             now,
         )
