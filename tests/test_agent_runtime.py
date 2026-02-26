@@ -1,8 +1,12 @@
 """Unit tests for agent_runtime.py."""
 
+import pytest
 from google.adk.agents.run_config import StreamingMode
 
 from agent_runtime import AgentRuntime
+
+
+pytestmark = pytest.mark.unit
 
 
 class TestAgentRuntime:

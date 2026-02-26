@@ -13,6 +13,9 @@ import httpx
 from notification_service import send_push_notification, delete_push_token
 
 
+pytestmark = pytest.mark.unit
+
+
 @pytest.fixture
 def mock_user_repo():
     """Mock user repository."""

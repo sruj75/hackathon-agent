@@ -1,131 +1,102 @@
-"""
-Test script for unified task management system.
-Tests the full workflow: add → timeblock → complete → delete
+"""Live smoke tests for unified task management.
 
-Run this from the agent directory:
-    python3 tests/test_unified_task_management.py
+These tests can create real Google Tasks/Calendar data for the authenticated user.
+They are excluded from default runs by pytest marker selection (`-m "not live"`).
 """
-import sys
+
+from __future__ import annotations
+
 import os
 from datetime import datetime
 
-# Add the parent directory (agent/) to the path
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import pytest
 
+from context import current_user_id, current_user_timezone
 from voice_agent.composio_tools import task_management
 
-def print_result(operation, result):
-    """Pretty print a result."""
-    print(f"\n{'='*60}")
-    print(f"Operation: {operation}")
-    print(f"Success: {result.get('success')}")
-    print(f"Message: {result.get('message')}")
-    if result.get('data'):
-        print(f"Data: {result.get('data')}")
-    print(f"{'='*60}")
 
-def test_full_workflow():
-    """Test the complete unified task management workflow."""
-    print("\n🧪 TESTING UNIFIED TASK MANAGEMENT SYSTEM")
-    print("=" * 60)
-    
-    test_task_title = f"Test Task {datetime.now().strftime('%H:%M:%S')}"
-    
-    # 1. Add unscheduled task
-    print("\n1️⃣  Adding unscheduled task...")
-    result = task_management("add_task", {
-        "title": test_task_title,
-        "notes": "This is a test task for the unified system",
-        "linked_to_goal": False
-    })
-    print_result("add_task", result)
-    
-    if not result.get("success"):
-        print("❌ Failed to add task. Stopping test.")
-        return
-    
-    # 2. Get pending tasks (should include our new task)
-    print("\n2️⃣  Getting pending tasks...")
-    result = task_management("get_tasks", {"status": "pending"})
-    print_result("get_tasks (pending)", result)
-    
-    # 3. Timeblock the task
-    print("\n3️⃣  Timeblocking task to calendar...")
-    current_time = datetime.now()
-    start_time = f"{current_time.hour:02d}:{current_time.minute:02d}"
-    
-    result = task_management("timeblock_task", {
-        "task_title": test_task_title,
-        "start_time": start_time,
-        "duration_minutes": 30
-    })
-    print_result("timeblock_task", result)
-    
-    if not result.get("success"):
-        print("❌ Failed to timeblock task. Continuing to test other operations...")
-    
-    # 4. Get scheduled tasks (should include our task now)
-    print("\n4️⃣  Getting scheduled tasks...")
-    result = task_management("get_tasks", {"status": "scheduled"})
-    print_result("get_tasks (scheduled)", result)
-    
-    # 5. Get today's schedule
-    print("\n5️⃣  Getting today's schedule...")
-    result = task_management("get_schedule", {"date": "today"})
-    print_result("get_schedule", result)
-    
-    # 6. Check for conflicts (should find our newly created event)
-    print("\n6️⃣  Checking for conflicts...")
-    end_time_hour = current_time.hour
-    end_time_minute = current_time.minute + 30
-    if end_time_minute >= 60:
-        end_time_hour += 1
-        end_time_minute -= 60
-    end_time = f"{end_time_hour:02d}:{end_time_minute:02d}"
-    
-    result = task_management("check_conflicts", {
-        "start_time": start_time,
-        "end_time": end_time
-    })
-    print_result("check_conflicts", result)
-    
-    # 7. Complete the task
-    print("\n7️⃣  Completing task...")
-    result = task_management("complete_task", {
-        "task_title": test_task_title
-    })
-    print_result("complete_task", result)
-    
-    if not result.get("success"):
-        print("❌ Failed to complete task. Continuing to cleanup...")
-    
-    # 8. Get completed tasks
-    print("\n8️⃣  Getting completed tasks...")
-    result = task_management("get_tasks", {"status": "completed"})
-    print_result("get_tasks (completed)", result)
-    
-    # 9. Delete the task (and linked event)
-    print("\n9️⃣  Deleting task and linked event...")
-    result = task_management("delete_task", {
-        "task_title": test_task_title
-    })
-    print_result("delete_task", result)
-    
-    if not result.get("success"):
-        print("❌ Failed to delete task.")
-    
-    print("\n" + "=" * 60)
-    print("✅ WORKFLOW TEST COMPLETE")
-    print("=" * 60)
-    print("\nNext steps:")
-    print("1. Check your Google Tasks - verify test task is deleted")
-    print("2. Check your Google Calendar - verify test event is deleted")
-    print("3. Review the logs above to ensure all operations succeeded")
+pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.live]
 
-if __name__ == "__main__":
+
+def _assert_success(operation: str, result: dict) -> None:
+    assert isinstance(result, dict), f"{operation} did not return a result dictionary"
+    assert result.get("success") is True, (
+        f"{operation} failed: error={result.get('error')} message={result.get('message')}"
+    )
+
+
+def _contains_task(result: dict, task_title: str) -> bool:
+    data = result.get("data")
+    if isinstance(data, list):
+        return any(isinstance(item, dict) and item.get("title") == task_title for item in data)
+    if isinstance(data, dict):
+        tasks = data.get("tasks")
+        if isinstance(tasks, list):
+            return any(isinstance(item, dict) and item.get("title") == task_title for item in tasks)
+    return False
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_LIVE_TASK_MANAGEMENT_TESTS") != "1",
+    reason="Set RUN_LIVE_TASK_MANAGEMENT_TESTS=1 to run live task management smoke tests.",
+)
+def test_full_workflow_live_smoke():
+    live_user_id = os.getenv("LIVE_TEST_USER_ID")
+    live_timezone = os.getenv("LIVE_TEST_TIMEZONE")
+    assert live_user_id, "Set LIVE_TEST_USER_ID to the authenticated user id for live tests."
+    assert live_timezone, "Set LIVE_TEST_TIMEZONE to a valid IANA timezone for live tests."
+
+    user_token = current_user_id.set(live_user_id)
+    tz_token = current_user_timezone.set(live_timezone)
+    test_task_title = f"Codex Live Task {datetime.now().strftime('%Y%m%d%H%M%S')}"
+    task_created = False
+
     try:
-        test_full_workflow()
-    except Exception as e:
-        print(f"\n❌ Test failed with error: {e}")
-        import traceback
-        traceback.print_exc()
+        add_result = task_management(
+            "add_task",
+            {
+                "title": test_task_title,
+                "notes": "Live smoke test task",
+                "linked_to_goal": False,
+            },
+        )
+        _assert_success("add_task", add_result)
+        task_created = True
+
+        pending_result = task_management("get_tasks", {"status": "pending"})
+        _assert_success("get_tasks[pending]", pending_result)
+        assert _contains_task(
+            pending_result, test_task_title
+        ), "New task not found in pending tasks"
+
+        now_local = datetime.now()
+        start_time = f"{now_local.hour:02d}:{now_local.minute:02d}"
+        timeblock_result = task_management(
+            "timeblock_task",
+            {
+                "task_title": test_task_title,
+                "start_time": start_time,
+                "duration_minutes": 30,
+            },
+        )
+        _assert_success("timeblock_task", timeblock_result)
+
+        scheduled_result = task_management("get_tasks", {"status": "scheduled"})
+        _assert_success("get_tasks[scheduled]", scheduled_result)
+        assert _contains_task(
+            scheduled_result, test_task_title
+        ), "Timeblocked task not found in scheduled tasks"
+
+        complete_result = task_management("complete_task", {"task_title": test_task_title})
+        _assert_success("complete_task", complete_result)
+
+    finally:
+        if task_created:
+            delete_result = task_management("delete_task", {"task_title": test_task_title})
+            assert isinstance(delete_result, dict), "delete_task did not return a result dictionary"
+            assert delete_result.get("success") is True, (
+                "Cleanup failed; manual cleanup may be required: "
+                f"error={delete_result.get('error')} message={delete_result.get('message')}"
+            )
+        current_user_timezone.reset(tz_token)
+        current_user_id.reset(user_token)

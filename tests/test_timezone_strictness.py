@@ -1,9 +1,13 @@
 """Timezone strictness regression tests for composio tool helpers."""
 
+import pytest
 from freezegun import freeze_time
 
 from context import current_user_timezone
 from voice_agent import composio_tools
+
+
+pytestmark = pytest.mark.regression
 
 
 def test_parse_iso_preserve_timezone_handles_utc_z():

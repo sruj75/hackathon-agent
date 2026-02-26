@@ -9,6 +9,9 @@ import time_machine
 import reminder_service
 
 
+pytestmark = pytest.mark.unit
+
+
 @pytest.mark.asyncio
 async def test_schedule_calendar_reminder_creates_t_minus_five(monkeypatch):
     list_pending_mock = AsyncMock(return_value=[])
@@ -42,6 +45,7 @@ async def test_schedule_calendar_reminder_creates_t_minus_five(monkeypatch):
 
 
 @pytest.mark.asyncio
+@time_machine.travel("2026-02-26T12:00:00+00:00", tick=False)
 async def test_schedule_calendar_reminder_uses_immediate_window(monkeypatch):
     now_utc = datetime.now(ZoneInfo("UTC"))
     start_soon = now_utc + timedelta(minutes=2)
@@ -75,8 +79,7 @@ async def test_schedule_calendar_reminder_uses_immediate_window(monkeypatch):
 
     assert result["immediate"] is True
     target_datetime = create_cron_mock.await_args.kwargs["target_datetime"]
-    assert target_datetime > now_utc + timedelta(seconds=5)
-    assert target_datetime < now_utc + timedelta(seconds=30)
+    assert target_datetime == now_utc + timedelta(seconds=10)
 
 
 @pytest.mark.asyncio

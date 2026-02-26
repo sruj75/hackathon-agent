@@ -1,4 +1,9 @@
+import pytest
+
 from voice_agent.onboarding_agent import ONBOARDING_INSTRUCTION
+
+
+pytestmark = pytest.mark.regression
 
 
 def test_onboarding_prompt_disallows_brand_self_identity():

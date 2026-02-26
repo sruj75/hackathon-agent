@@ -11,6 +11,9 @@ import pytest
 from repos import event_repo, session_repo, user_repo
 
 
+pytestmark = pytest.mark.integration
+
+
 class FakeAcquire:
     def __init__(self, conn: "FakeConnection"):
         self.conn = conn

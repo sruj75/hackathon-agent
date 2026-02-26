@@ -10,16 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from httpx import ASGITransport, AsyncClient
 
 import main
-from auth import AuthUser, get_authenticated_user
+from auth import AuthUser
 from session_manager import ADKSessionManager
-
-
-async def _fake_auth_user():
-    return AuthUser(user_id="user_test", email="test@example.com", claims={})
-
 
 class _FakeContent:
     def __init__(self, parts=None, role=None):
@@ -464,89 +458,6 @@ class TestMorningWakeBootstrap:
         create_cron_mock.assert_not_awaited()
         update_event_mock.assert_not_awaited()
         delete_job_mock.assert_not_awaited()
-
-
-@pytest.mark.regression
-class TestPreferencesEndpoints:
-    @pytest.mark.asyncio
-    async def test_get_preferences_not_found(self, monkeypatch):
-        monkeypatch.setattr(main.user_repo, "get_profile", AsyncMock(return_value=None))
-        main.app.dependency_overrides[get_authenticated_user] = _fake_auth_user
-
-        async with AsyncClient(
-            transport=ASGITransport(app=main.app),
-            base_url="http://test",
-        ) as client:
-            response = await client.get("/api/preferences/me")
-        main.app.dependency_overrides.clear()
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["status"] == "not_found"
-        assert body["user_id"] == "user_test"
-        assert body["is_complete"] is False
-
-    @pytest.mark.asyncio
-    async def test_put_preferences_rejects_invalid_payload(self):
-        main.app.dependency_overrides[get_authenticated_user] = _fake_auth_user
-        async with AsyncClient(
-            transport=ASGITransport(app=main.app),
-            base_url="http://test",
-        ) as client:
-            response = await client.put(
-                "/api/preferences/me",
-                json={
-                    "wake_time": "8am",
-                    "bedtime": "99:00",
-                    "timezone": "Not/A_Timezone",
-                    "health_anchors": [],
-                },
-            )
-        main.app.dependency_overrides.clear()
-
-        assert response.status_code == 400
-        detail = response.json()["detail"]
-        assert "errors" in detail
-        assert len(detail["errors"]) >= 1
-
-    @pytest.mark.asyncio
-    async def test_put_preferences_saves_and_resyncs_scheduler(self, monkeypatch):
-        updated_profile = {
-            "user_id": "user_test",
-            "wake_time": "07:30",
-            "bedtime": "22:15",
-            "timezone": "America/New_York",
-            "health_anchors": ["sleep", "lunch"],
-        }
-        update_profile_mock = AsyncMock(return_value=updated_profile)
-        resync_mock = AsyncMock(return_value=None)
-
-        monkeypatch.setattr(main.user_repo, "update_profile", update_profile_mock)
-        monkeypatch.setattr(main, "_ensure_morning_wake_for_user", resync_mock)
-        main.app.dependency_overrides[get_authenticated_user] = _fake_auth_user
-
-        async with AsyncClient(
-            transport=ASGITransport(app=main.app),
-            base_url="http://test",
-        ) as client:
-            response = await client.put(
-                "/api/preferences/me",
-                json={
-                    "wake_time": "07:30",
-                    "bedtime": "22:15",
-                    "timezone": "America/New_York",
-                    "health_anchors": ["sleep", "lunch"],
-                },
-            )
-        main.app.dependency_overrides.clear()
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["status"] == "ok"
-        assert body["scheduler"]["resynced"] is True
-        assert body["preferences"]["wake_time"] == "07:30"
-        update_profile_mock.assert_awaited_once()
-        resync_mock.assert_awaited_once_with(updated_profile)
 
 
 @pytest.mark.regression

@@ -8,6 +8,9 @@ from freezegun import freeze_time
 from session_manager import ADKSessionManager
 
 
+pytestmark = pytest.mark.unit
+
+
 def _build_service(get_session_return=None, create_session_return=None):
     service = MagicMock()
     service.get_session = AsyncMock(return_value=get_session_return)

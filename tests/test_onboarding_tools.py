@@ -7,6 +7,9 @@ from context import current_user_id, current_user_timezone
 from voice_agent import onboarding_tools
 
 
+pytestmark = pytest.mark.unit
+
+
 @pytest.mark.asyncio
 async def test_get_onboarding_context_requires_user_context():
     result = await onboarding_tools.get_onboarding_context()

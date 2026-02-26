@@ -11,6 +11,9 @@ import main
 from auth import AuthUser, get_authenticated_user
 
 
+pytestmark = pytest.mark.integration
+
+
 @pytest.fixture
 async def api_client():
     async def _fake_user():

@@ -8,6 +8,9 @@ import pytest
 import cron_service
 
 
+pytestmark = pytest.mark.unit
+
+
 @pytest.mark.asyncio
 async def test_create_one_time_job_delegates_to_event_repo(monkeypatch):
     schedule_mock = AsyncMock(return_value=12345)
