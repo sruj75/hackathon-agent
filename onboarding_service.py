@@ -69,6 +69,30 @@ def _normalize_playbook(
     }
 
 
+def validate_playbook_for_completion(playbook: dict[str, Any] | None) -> list[str]:
+    """Enforce minimum onboarding intake quality before completion."""
+    source = playbook if isinstance(playbook, dict) else {}
+    errors: list[str] = []
+
+    summary = source.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        errors.append("playbook.summary is required")
+
+    struggles = _normalize_str_list(source.get("struggles"))
+    if len(struggles) < 1:
+        errors.append("playbook.struggles must contain at least one item")
+
+    goals = _normalize_str_list(source.get("goals"))
+    if len(goals) < 1:
+        errors.append("playbook.goals must contain at least one item")
+
+    communication_style = source.get("communication_style")
+    if not isinstance(communication_style, str) or not communication_style.strip():
+        errors.append("playbook.communication_style is required")
+
+    return errors
+
+
 async def get_onboarding_context_for_user(user_id: str) -> dict[str, Any]:
     profile = await user_repo.get_profile(user_id)
     if not profile:
@@ -114,6 +138,10 @@ async def complete_onboarding_for_user(
         raise ValueError("wake_time must be HH:MM in 24-hour format")
     if not _is_valid_hhmm(bedtime):
         raise ValueError("bedtime must be HH:MM in 24-hour format")
+
+    playbook_errors = validate_playbook_for_completion(playbook)
+    if playbook_errors:
+        raise ValueError("; ".join(playbook_errors))
 
     profile = await user_repo.get_profile(user_id)
     resolved_timezone = _normalize_timezone(timezone_name) or _normalize_timezone(

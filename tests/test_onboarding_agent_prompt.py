@@ -10,6 +10,8 @@ def test_onboarding_prompt_enforces_required_capture_flow():
     assert "Collect wake_time and bedtime." in ONBOARDING_INSTRUCTION
     assert "Final values MUST be HH:MM in 24-hour format before completion." in ONBOARDING_INSTRUCTION
     assert "Ask where they struggle with ADHD/executive function." in ONBOARDING_INSTRUCTION
+    assert "Never call complete_onboarding until all minimum completion quality checks pass." in ONBOARDING_INSTRUCTION
+    assert "do not act like a general assistant" in ONBOARDING_INSTRUCTION.lower()
     assert "Do not switch into ongoing task-help mode during onboarding." in ONBOARDING_INSTRUCTION
 
 

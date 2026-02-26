@@ -68,6 +68,35 @@ def _event_field(event: object, field: str, default=None):
     return getattr(event, field, default)
 
 
+def _as_json_object(value: object, *, context: str) -> dict[str, Any]:
+    """Normalize mixed JSON payload shapes to an object."""
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            logger.warning("[%s] Expected JSON object payload, got non-JSON string", context)
+            return {}
+        if isinstance(decoded, dict):
+            return decoded
+        logger.warning(
+            "[%s] Expected JSON object payload, got decoded %s",
+            context,
+            type(decoded).__name__,
+        )
+        return {}
+
+    logger.warning(
+        "[%s] Expected JSON object payload, got %s",
+        context,
+        type(value).__name__,
+    )
+    return {}
+
+
 def _env_flag_enabled(name: str, default: str) -> bool:
     """Parse common boolean env flags."""
     return os.getenv(name, default).lower() in ("1", "true", "yes")
@@ -458,7 +487,10 @@ async def _ensure_morning_wake_for_user(user: dict) -> None:
             return
 
         existing_scheduled = _as_datetime(_event_field(existing, "scheduled_time"))
-        existing_payload = _event_field(existing, "payload", {}) or {}
+        existing_payload = _as_json_object(
+            _event_field(existing, "payload", {}),
+            context=f"morning-bootstrap event payload user={user_id}",
+        )
         existing_cron_job_id = _event_field(existing, "cron_job_id")
 
         # Reschedule when wake time/timezone changed, or when cron id is missing.
@@ -563,7 +595,10 @@ async def _reconcile_missing_cron_jobs() -> None:
             if not event_id:
                 continue
             event_type = _event_field(event, "event_type", "")
-            payload = _event_field(event, "payload", {}) or {}
+            payload = _as_json_object(
+                _event_field(event, "payload", {}),
+                context=f"cron-reconcile event payload event_id={event_id}",
+            )
             owner = payload.get("schedule_owner")
             reason = payload.get("reason")
             policy = payload.get("schedule_policy")

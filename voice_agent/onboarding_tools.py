@@ -8,6 +8,7 @@ from context import current_user_id, current_user_timezone
 from onboarding_service import (
     complete_onboarding_for_user,
     get_onboarding_context_for_user,
+    validate_playbook_for_completion,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,10 @@ async def complete_onboarding(
     if not isinstance(parsed, dict):
         return {"status": "error", "error": "playbook_json must decode to an object"}
     playbook = parsed
+
+    playbook_errors = validate_playbook_for_completion(playbook)
+    if playbook_errors:
+        return {"status": "error", "error": "; ".join(playbook_errors)}
 
     try:
         import main as app_main  # Lazy import to avoid import cycles at module load.

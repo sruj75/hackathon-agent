@@ -58,7 +58,10 @@ async def test_complete_onboarding_calls_shared_workflow(monkeypatch):
         result = await onboarding_tools.complete_onboarding(
             wake_time="07:30",
             bedtime="22:15",
-            playbook_json='{"summary":"test"}',
+            playbook_json=(
+                '{"summary":"test summary","struggles":["procrastination"],'
+                '"goals":["start work on time"],"communication_style":"direct and concise"}'
+            ),
         )
 
         assert result["status"] == "ok"
@@ -68,7 +71,12 @@ async def test_complete_onboarding_calls_shared_workflow(monkeypatch):
             wake_time="07:30",
             bedtime="22:15",
             timezone_name="America/New_York",
-            playbook={"summary": "test"},
+            playbook={
+                "summary": "test summary",
+                "struggles": ["procrastination"],
+                "goals": ["start work on time"],
+                "communication_style": "direct and concise",
+            },
             health_anchors=None,
         )
     finally:
@@ -88,6 +96,29 @@ async def test_complete_onboarding_rejects_invalid_playbook_json():
         )
         assert result["status"] == "error"
         assert result["error"] == "playbook_json must be valid JSON"
+    finally:
+        current_user_id.reset(user_token)
+        current_user_timezone.reset(tz_token)
+
+
+@pytest.mark.asyncio
+async def test_complete_onboarding_rejects_incomplete_playbook(monkeypatch):
+    user_token = current_user_id.set("user_test")
+    tz_token = current_user_timezone.set("America/New_York")
+    workflow_mock = AsyncMock()
+    try:
+        monkeypatch.setattr(main, "_complete_onboarding_workflow", workflow_mock)
+        result = await onboarding_tools.complete_onboarding(
+            wake_time="07:30",
+            bedtime="22:15",
+            playbook_json='{"summary":"", "struggles": [], "goals": []}',
+        )
+        assert result["status"] == "error"
+        assert "playbook.summary is required" in result["error"]
+        assert "playbook.struggles must contain at least one item" in result["error"]
+        assert "playbook.goals must contain at least one item" in result["error"]
+        assert "playbook.communication_style is required" in result["error"]
+        workflow_mock.assert_not_awaited()
     finally:
         current_user_id.reset(user_token)
         current_user_timezone.reset(tz_token)

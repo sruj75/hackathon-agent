@@ -435,6 +435,36 @@ class TestMorningWakeBootstrap:
         create_event_mock.assert_not_awaited()
         create_cron_mock.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_existing_event_with_string_payload_does_not_crash(self, monkeypatch):
+        target_local = datetime(2026, 2, 8, 9, 0, tzinfo=timezone.utc)
+        find_pending_mock = AsyncMock(
+            return_value={
+                "id": "event_existing",
+                "scheduled_time": target_local,
+                "payload": '{"timezone":"UTC"}',
+                "cron_job_id": 321,
+            }
+        )
+        create_cron_mock = AsyncMock(return_value=999)
+        update_event_mock = AsyncMock(return_value=True)
+        delete_job_mock = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(main, "_next_morning_wake_datetime", lambda *_args: target_local)
+        monkeypatch.setattr(main.event_repo, "find_pending_morning_event", find_pending_mock)
+        monkeypatch.setattr(main.cron_service, "create_one_time_job", create_cron_mock)
+        monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
+        monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
+
+        await main._ensure_morning_wake_for_user(
+            {"user_id": "user_test", "timezone": "UTC", "wake_time": "09:00"}
+        )
+
+        # Matching timezone and schedule means no reschedule required.
+        create_cron_mock.assert_not_awaited()
+        update_event_mock.assert_not_awaited()
+        delete_job_mock.assert_not_awaited()
+
 
 @pytest.mark.regression
 class TestPreferencesEndpoints:
@@ -590,6 +620,38 @@ class TestAutonomySchedulingBoundaries:
         payload = update_event_mock.await_args.kwargs["payload"]
         assert payload["schedule_owner"] == "system"
         assert payload["schedule_policy"] == "morning_bootstrap"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_handles_string_payload_rows(self, monkeypatch):
+        scheduled_time = datetime(2026, 2, 9, 9, 0, tzinfo=timezone.utc)
+        list_missing_mock = AsyncMock(
+            return_value=[
+                {
+                    "id": "event_morning_system",
+                    "event_type": "morning_wake",
+                    "scheduled_time": scheduled_time,
+                    "payload": '{"reason":"daily_bootstrap","timezone":"UTC"}',
+                },
+            ]
+        )
+        create_cron_mock = AsyncMock(return_value=111)
+        update_cron_job_id_mock = AsyncMock(return_value=True)
+        update_event_mock = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            main.event_repo,
+            "list_future_unexecuted_events_missing_cron",
+            list_missing_mock,
+        )
+        monkeypatch.setattr(main.cron_service, "create_one_time_job", create_cron_mock)
+        monkeypatch.setattr(main.event_repo, "update_cron_job_id", update_cron_job_id_mock)
+        monkeypatch.setattr(main.event_repo, "update_event", update_event_mock)
+
+        await main._reconcile_missing_cron_jobs()
+
+        create_cron_mock.assert_awaited_once()
+        update_cron_job_id_mock.assert_awaited_once_with("event_morning_system", 111)
+        update_event_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_startup_skips_reconcile_by_default(self, monkeypatch):
