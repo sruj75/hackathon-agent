@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -32,7 +33,7 @@ async def get_onboarding_context() -> dict[str, Any]:
 async def complete_onboarding(
     wake_time: str,
     bedtime: str,
-    playbook: dict[str, Any] | None = None,
+    playbook_json: str = "{}",
 ) -> dict[str, Any]:
     """
     Persist onboarding completion artifact.
@@ -48,6 +49,16 @@ async def complete_onboarding(
         return {"status": "error", "error": "missing_user_context"}
 
     timezone_name = current_user_timezone.get()
+    try:
+        parsed = json.loads(playbook_json) if playbook_json else {}
+    except json.JSONDecodeError:
+        return {"status": "error", "error": "playbook_json must be valid JSON"}
+
+    if parsed is None:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        return {"status": "error", "error": "playbook_json must decode to an object"}
+    playbook = parsed
 
     try:
         import main as app_main  # Lazy import to avoid import cycles at module load.

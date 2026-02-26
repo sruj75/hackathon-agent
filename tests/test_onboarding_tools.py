@@ -58,7 +58,7 @@ async def test_complete_onboarding_calls_shared_workflow(monkeypatch):
         result = await onboarding_tools.complete_onboarding(
             wake_time="07:30",
             bedtime="22:15",
-            playbook={"summary": "test"},
+            playbook_json='{"summary":"test"}',
         )
 
         assert result["status"] == "ok"
@@ -71,6 +71,23 @@ async def test_complete_onboarding_calls_shared_workflow(monkeypatch):
             playbook={"summary": "test"},
             health_anchors=None,
         )
+    finally:
+        current_user_id.reset(user_token)
+        current_user_timezone.reset(tz_token)
+
+
+@pytest.mark.asyncio
+async def test_complete_onboarding_rejects_invalid_playbook_json():
+    user_token = current_user_id.set("user_test")
+    tz_token = current_user_timezone.set("America/New_York")
+    try:
+        result = await onboarding_tools.complete_onboarding(
+            wake_time="07:30",
+            bedtime="22:15",
+            playbook_json="{invalid-json",
+        )
+        assert result["status"] == "error"
+        assert result["error"] == "playbook_json must be valid JSON"
     finally:
         current_user_id.reset(user_token)
         current_user_timezone.reset(tz_token)

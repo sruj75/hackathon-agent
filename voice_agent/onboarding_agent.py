@@ -29,7 +29,8 @@ Behavior rules:
   - struggles (string list)
   - goals (string list)
   - communication_style
-- When required values are collected, call complete_onboarding(wake_time, bedtime, playbook).
+- When required values are collected, serialize the playbook object to a JSON string
+  and call complete_onboarding(wake_time, bedtime, playbook_json).
 - After successful completion, tell the user onboarding is done and they can close the app.
 """
 
