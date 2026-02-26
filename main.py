@@ -1270,7 +1270,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 )
 
         activation_prompt = (
-            "Start onboarding: briefly greet the user and ask the first onboarding question."
+            "Start onboarding only: welcome the user to Intentive, ask the first onboarding "
+            "question, and do not switch to general assistant mode."
             if onboarding_mode
             else "Start with a brief greeting, then ask how you can help."
         )
