@@ -765,15 +765,20 @@ def timeblock_task(task_title: str, start_time: str, duration_minutes: int = 60,
         except LookupError:
             tool_user_id = None
 
-        if tool_user_id and event_id:
+        event_start_time = event_result["data"]["event"].get("start_time")
+        reminder_eligible = bool(event_id and isinstance(event_start_time, str) and event_start_time)
+
+        if tool_user_id and reminder_eligible:
             try:
                 user_timezone = _get_user_timezone()
+                # Validate datetime shape before enqueueing reminder scheduling.
+                parse_iso_preserve_timezone(event_start_time)
                 _run_async_task(
                     schedule_calendar_reminder(
                         user_id=tool_user_id,
                         calendar_event_id=event_id,
                         event_title=event_result["data"]["event"]["title"],
-                        event_start_time=event_result["data"]["event"]["start_time"],
+                        event_start_time=event_start_time,
                         timezone_name=user_timezone,
                         lead_minutes=5,
                         source="agent_timeblock",
@@ -786,6 +791,11 @@ def timeblock_task(task_title: str, start_time: str, duration_minutes: int = 60,
                     event_id,
                     reminder_error,
                 )
+        elif tool_user_id and event_id:
+            logger.warning(
+                "[REMINDER] Skipping reminder enqueue for event %s due to missing/invalid start_time",
+                event_id,
+            )
 
         return {
             "success": True,

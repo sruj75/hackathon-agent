@@ -1,6 +1,7 @@
 from typing import Optional, Dict, Any
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from google.adk.sessions import InMemorySessionService, Session
 
 from repos import session_repo
@@ -144,7 +145,11 @@ class ADKSessionManager:
             return None
 
     @staticmethod
-    def get_daily_session_id(user_id: str) -> str:
+    def get_daily_session_id(
+        user_id: str,
+        timezone_name: Optional[str] = None,
+        now_utc: Optional[datetime] = None,
+    ) -> str:
         """
         Generates the deterministic session ID for a user's daily agent thread.
         Format: session_{user_id}_{YYYY-MM-DD}
@@ -152,5 +157,23 @@ class ADKSessionManager:
         This ensures that whether we are accessed via Cron (Start/Check-in) 
         or via WebSocket (Voice), we always hit the SAME session.
         """
-        today = datetime.now().date().isoformat()
+        now = now_utc or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
+
+        resolved_tz = None
+        if timezone_name:
+            try:
+                resolved_tz = ZoneInfo(timezone_name)
+            except Exception:
+                logger.warning(
+                    "Invalid timezone '%s' for session id generation, falling back to local runtime timezone",
+                    timezone_name,
+                )
+        if resolved_tz is None:
+            today = datetime.now().astimezone().date().isoformat()
+        else:
+            today = now.astimezone(resolved_tz).date().isoformat()
         return f"session_{user_id}_{today}"

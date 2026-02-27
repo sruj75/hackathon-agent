@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from composio import Composio
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables BEFORE importing agent
@@ -126,6 +126,9 @@ APP_NAME = "intentive-coach"
 COMPOSIO_INTEGRATION_APPS = ("googlecalendar", "googletasks")
 ONBOARDING_STATUS_PENDING = "pending"
 ONBOARDING_STATUS_COMPLETED = "completed"
+ENTRY_MODE_REACTIVE = "reactive"
+ENTRY_MODE_PROACTIVE = "proactive"
+ENTRY_MODE_POST_ONBOARDING = "post_onboarding"
 
 # ========================================
 # FastAPI App Setup
@@ -329,14 +332,36 @@ def _select_onboarding_session_id(user_id: str, requested_session_id: str | None
     return requested_session_id
 
 
-def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str:
+def _current_local_date(timezone_name: str | None) -> str:
+    tz: ZoneInfo | None = None
+    if timezone_name:
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            logger.warning(
+                "Invalid timezone '%s' for date key, using local runtime timezone",
+                timezone_name,
+            )
+    if tz is None:
+        return datetime.now().astimezone().date().isoformat()
+    return datetime.now(timezone.utc).astimezone(tz).date().isoformat()
+
+
+def _select_ws_session_id(
+    user_id: str,
+    requested_session_id: str | None,
+    timezone_name: str | None = None,
+) -> str:
     """
     Select conversation session ID.
 
     Uses explicit session IDs only when they follow our deterministic pattern and
     belong to the same user; otherwise falls back to today's unified session.
     """
-    fallback_session_id = ADKSessionManager.get_daily_session_id(user_id)
+    fallback_session_id = ADKSessionManager.get_daily_session_id(
+        user_id,
+        timezone_name=timezone_name,
+    )
     if not requested_session_id:
         return fallback_session_id
 
@@ -345,6 +370,10 @@ def _select_ws_session_id(user_id: str, requested_session_id: str | None) -> str
         return fallback_session_id
 
     if match.group("user_id") != user_id:
+        return fallback_session_id
+
+    expected_date = _current_local_date(timezone_name)
+    if match.group("date") != expected_date:
         return fallback_session_id
 
     return requested_session_id
@@ -380,6 +409,143 @@ def _require_timezone(timezone_name: str | None, *, context: str) -> str:
             },
         )
     return normalized
+
+
+def _normalize_entry_mode(value: object) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in (ENTRY_MODE_PROACTIVE, ENTRY_MODE_POST_ONBOARDING):
+        return mode
+    return ENTRY_MODE_REACTIVE
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _build_entry_context(
+    init_message: dict[str, Any],
+    *,
+    default_trigger_type: object,
+    resolved_timezone: str | None,
+) -> dict[str, Any]:
+    trigger_type = (
+        str(default_trigger_type).strip()
+        if isinstance(default_trigger_type, str) and str(default_trigger_type).strip()
+        else None
+    )
+    source = init_message.get("source")
+    if not isinstance(source, str) or not source.strip():
+        source = "manual"
+
+    entry_mode_raw = init_message.get("entry_mode")
+    entry_mode = _normalize_entry_mode(entry_mode_raw)
+    if entry_mode == ENTRY_MODE_REACTIVE and source == "push":
+        entry_mode = ENTRY_MODE_PROACTIVE
+    if trigger_type == ENTRY_MODE_POST_ONBOARDING:
+        entry_mode = ENTRY_MODE_POST_ONBOARDING
+
+    context: dict[str, Any] = {
+        "entry_mode": entry_mode,
+        "source": source,
+        "trigger_type": trigger_type,
+        "event_id": init_message.get("event_id")
+        if isinstance(init_message.get("event_id"), str)
+        else None,
+        "calendar_event_id": init_message.get("calendar_event_id")
+        if isinstance(init_message.get("calendar_event_id"), str)
+        else None,
+        "scheduled_time": init_message.get("scheduled_time")
+        if isinstance(init_message.get("scheduled_time"), str)
+        else None,
+        "timezone": resolved_timezone,
+        "is_stale": False,
+    }
+    return context
+
+
+def _is_entry_context_stale(entry_context: dict[str, Any], timezone_name: str | None) -> bool:
+    if entry_context.get("entry_mode") != ENTRY_MODE_PROACTIVE:
+        return False
+    scheduled = _parse_iso_datetime(entry_context.get("scheduled_time"))
+    if not scheduled:
+        return False
+    if not timezone_name:
+        return False
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        return False
+
+    scheduled_day = scheduled.astimezone(tz).date().isoformat()
+    current_day = datetime.now(timezone.utc).astimezone(tz).date().isoformat()
+    return scheduled_day != current_day
+
+
+def _playbook_summary(playbook: dict[str, Any] | object) -> dict[str, Any]:
+    source = playbook if isinstance(playbook, dict) else {}
+    return {
+        "summary": source.get("summary") if isinstance(source.get("summary"), str) else "",
+        "struggles": _normalize_health_anchors(source.get("struggles")),
+        "goals": _normalize_health_anchors(source.get("goals")),
+        "communication_style": source.get("communication_style")
+        if isinstance(source.get("communication_style"), str)
+        else "",
+    }
+
+
+def _build_profile_context(profile: dict | None) -> dict[str, Any]:
+    source = profile or {}
+    return {
+        "preferences": {
+            "wake_time": source.get("wake_time"),
+            "bedtime": source.get("bedtime"),
+            "timezone": source.get("timezone"),
+            "health_anchors": _normalize_health_anchors(source.get("health_anchors")),
+        },
+        "playbook": _playbook_summary(source.get("playbook")),
+        "onboarding_status": _normalize_onboarding_status(source.get("onboarding_status")),
+    }
+
+
+def _build_main_activation_prompt(entry_context: dict[str, Any]) -> str:
+    entry_mode = entry_context.get("entry_mode")
+    trigger_type = entry_context.get("trigger_type")
+    event_id = entry_context.get("event_id")
+    is_stale = bool(entry_context.get("is_stale"))
+
+    if entry_mode == ENTRY_MODE_POST_ONBOARDING:
+        return (
+            "Start main-agent mode after onboarding completion. Ground on the user's local time, "
+            "schedule, and onboarding profile context. If it's late, guide a wind-down routine; "
+            "otherwise, help plan the remainder of today with prioritized timeboxed essentials."
+        )
+
+    if entry_mode == ENTRY_MODE_PROACTIVE and not is_stale:
+        return (
+            "Start proactive check-in mode. Use current time, schedule, and profile context. "
+            f"Trigger type: {trigger_type or 'unknown'}. Event id: {event_id or 'n/a'}. "
+            "Open by addressing the specific transition intention for this check-in, then drive the "
+            "next concrete action."
+        )
+
+    if entry_mode == ENTRY_MODE_PROACTIVE and is_stale:
+        return (
+            "A stale notification was opened. Do not revive old context. Reset to present-moment "
+            "support and help the user get back on track based on current time and schedule."
+        )
+
+    return (
+        "Start reactive mode. Ground on current time, schedule, and profile context, then ask what "
+        "the user needs right now."
+    )
 
 
 def _validate_onboarding_complete_payload(payload: dict) -> tuple[dict, list[str]]:
@@ -739,6 +905,7 @@ async def _complete_onboarding_workflow(
             ),
         },
         "route_hint": route_hint,
+        "handoff_to_main": route_hint == "assistant",
         "scheduler": {
             "resynced": scheduler_error is None,
             "error": scheduler_error,
@@ -1012,9 +1179,46 @@ async def _resolve_calendar_reminder_timezone(
     return _normalize_timezone((profile or {}).get("timezone"))
 
 
+async def _resolve_session_timezone_for_event(
+    event_user_id: str,
+    payload: dict,
+    *,
+    calendar_timezone: str | None = None,
+) -> str | None:
+    if calendar_timezone:
+        return calendar_timezone
+    payload_timezone = _normalize_timezone(payload.get("timezone"))
+    if payload_timezone:
+        return payload_timezone
+
+    try:
+        profile = await user_repo.get_profile(event_user_id)
+    except Exception as profile_error:
+        logger.warning(
+            "[execute-event] Failed to load profile timezone for user=%s: %s",
+            event_user_id,
+            profile_error,
+        )
+        return None
+    profile_timezone = _normalize_timezone((profile or {}).get("timezone"))
+    return profile_timezone
+
+
+def _validate_scheduler_secret(
+    provided_secret: str | None,
+) -> None:
+    expected_secret = os.getenv("SCHEDULER_SECRET", "").strip()
+    if not expected_secret:
+        logger.error("SCHEDULER_SECRET is not configured")
+        raise HTTPException(status_code=500, detail="scheduler_secret_not_configured")
+    if not provided_secret or provided_secret.strip() != expected_secret:
+        raise HTTPException(status_code=401, detail="unauthorized_scheduler_request")
+
+
 @app.post("/api/execute-event/{event_id}")
 async def execute_event(
     event_id: str,
+    scheduler_secret: str | None = Header(default=None, alias="X-Scheduler-Secret"),
 ):
     """
     Execute a specific scheduled event.
@@ -1022,6 +1226,8 @@ async def execute_event(
     
     Security: Event IDs are UUIDs (unguessable) and execution is idempotent.
     """
+    _validate_scheduler_secret(scheduler_secret)
+
     event = await event_repo.get_by_id(event_id)
     
     # Null check: if event doesn't exist, return 404
@@ -1047,9 +1253,26 @@ async def execute_event(
             payload["timezone"] = calendar_timezone
 
     reason = str(payload.get("reason") or "scheduled_checkin")
-    session_id = ADKSessionManager.get_daily_session_id(event_user_id)
+    session_timezone = await _resolve_session_timezone_for_event(
+        event_user_id,
+        payload,
+        calendar_timezone=calendar_timezone,
+    )
+    if not session_timezone:
+        logger.warning(
+            "[execute-event] Missing timezone for user=%s event_id=%s event_type=%s",
+            event_user_id,
+            event_id,
+            event_type,
+        )
+        session_timezone = None
+    session_id = ADKSessionManager.get_daily_session_id(
+        event_user_id,
+        timezone_name=session_timezone,
+    )
     trigger_type = str(payload.get("trigger_type") or event_type)
     calendar_event_id = payload.get("calendar_event_id")
+    scheduled_time = _as_datetime(_event_field(event, "scheduled_time"))
 
     title = "Check-in"
     body = "You have a scheduled check-in."
@@ -1072,12 +1295,21 @@ async def execute_event(
         "trigger_type": trigger_type,
         "event_id": event_id,
         "user_id": event_user_id,
+        "source": "push",
+        "entry_mode": ENTRY_MODE_PROACTIVE,
+        "scheduled_time": scheduled_time.isoformat() if scheduled_time else None,
     }
     if isinstance(calendar_event_id, str) and calendar_event_id:
         notification_data["calendar_event_id"] = calendar_event_id
 
     push_sent = False
-    if event_type == "calendar_reminder" and not calendar_timezone:
+    if not session_timezone:
+        logger.warning(
+            "[execute-event] Skipping push due to missing session timezone user=%s event_id=%s",
+            event_user_id,
+            event_id,
+        )
+    elif event_type == "calendar_reminder" and not calendar_timezone:
         logger.warning(
             "[execute-event] Skipping calendar reminder push due to missing timezone user=%s event_id=%s",
             event_user_id,
@@ -1099,7 +1331,9 @@ async def execute_event(
 
     now_utc = datetime.now(timezone.utc)
     last_error = None if push_sent else "push_failed_or_missing_token"
-    if event_type == "calendar_reminder" and not calendar_timezone:
+    if not session_timezone:
+        last_error = "missing_timezone"
+    elif event_type == "calendar_reminder" and not calendar_timezone:
         last_error = "missing_timezone"
 
     await event_repo.update_event(
@@ -1252,6 +1486,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             logger.warning("[WS-INIT] Failed to load profile for %s: %s", user_id, profile_error)
             profile = None
 
+        client_timezone = _normalize_timezone(init_message.get("timezone"))
+        profile_timezone = _normalize_timezone((profile or {}).get("timezone"))
+        resolved_timezone = client_timezone or profile_timezone
+
         resume_session_id = init_message.get("resume_session_id")
         requested_session_id = (
             resume_session_id
@@ -1259,12 +1497,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             else session_id
         )
         trigger_type = init_message.get("trigger_type")
+        entry_context = _build_entry_context(
+            init_message,
+            default_trigger_type=trigger_type,
+            resolved_timezone=resolved_timezone,
+        )
+        if _is_entry_context_stale(entry_context, resolved_timezone):
+            entry_context["is_stale"] = True
+            entry_context["entry_mode"] = ENTRY_MODE_REACTIVE
+            requested_session_id = None
+
         onboarding_mode = _use_onboarding_mode(trigger_type, profile)
 
         if onboarding_mode:
             unified_session_id = _select_onboarding_session_id(user_id, requested_session_id)
         else:
-            unified_session_id = _select_ws_session_id(user_id, requested_session_id)
+            unified_session_id = _select_ws_session_id(
+                user_id,
+                requested_session_id,
+                timezone_name=resolved_timezone,
+            )
 
         logger.info(
             "[WS-INIT] Authenticated websocket user=%s, session=%s, onboarding_mode=%s",
@@ -1288,13 +1540,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         if effective_trigger_type:
             session.state["trigger_type"] = effective_trigger_type
         session.state["agent_mode"] = "onboarding" if onboarding_mode else "main"
+        session.state["entry_mode"] = str(entry_context.get("entry_mode") or ENTRY_MODE_REACTIVE)
+        session.state["entry_context"] = entry_context
 
-        client_timezone = _normalize_timezone(init_message.get("timezone"))
-        profile_timezone = _normalize_timezone((profile or {}).get("timezone"))
-        resolved_timezone = client_timezone or profile_timezone
         current_user_timezone.set(resolved_timezone)
         if resolved_timezone:
             session.state["user_timezone"] = resolved_timezone
+            if profile is None:
+                profile = {"user_id": user_id}
+            profile["timezone"] = resolved_timezone
             try:
                 await user_repo.update_profile(user_id, timezone=resolved_timezone)
             except Exception as profile_update_error:
@@ -1304,11 +1558,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     profile_update_error,
                 )
 
+        if not onboarding_mode:
+            profile_context = _build_profile_context(profile)
+            session.state["profile_context"] = profile_context
+
         activation_prompt = (
             "Start onboarding only: welcome the user to Intentive, ask the first onboarding "
             "question, and do not switch to general assistant mode."
             if onboarding_mode
-            else "Start with a brief greeting, then ask how you can help."
+            else _build_main_activation_prompt(entry_context)
         )
         activation_message = types.Content(
             role="user",

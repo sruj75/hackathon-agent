@@ -14,6 +14,10 @@ from auth import AuthUser, get_authenticated_user
 pytestmark = pytest.mark.integration
 
 
+def _scheduler_headers() -> dict[str, str]:
+    return {"X-Scheduler-Secret": "test_scheduler_secret"}
+
+
 @pytest.fixture
 async def api_client():
     async def _fake_user():
@@ -78,9 +82,13 @@ async def test_save_token_rejects_invalid_payload(api_client):
 
 @pytest.mark.asyncio
 async def test_execute_event_not_found(api_client, monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SECRET", "test_scheduler_secret")
     monkeypatch.setattr(main.event_repo, "get_by_id", AsyncMock(return_value=None))
 
-    response = await api_client.post("/api/execute-event/event_missing")
+    response = await api_client.post(
+        "/api/execute-event/event_missing",
+        headers=_scheduler_headers(),
+    )
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Event not found"
@@ -88,13 +96,17 @@ async def test_execute_event_not_found(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_event_already_executed(api_client, monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SECRET", "test_scheduler_secret")
     monkeypatch.setattr(
         main.event_repo,
         "get_by_id",
         AsyncMock(return_value={"id": "event_done", "executed": True}),
     )
 
-    response = await api_client.post("/api/execute-event/event_done")
+    response = await api_client.post(
+        "/api/execute-event/event_done",
+        headers=_scheduler_headers(),
+    )
 
     assert response.status_code == 200
     assert response.json() == {"status": "already_executed"}
@@ -102,11 +114,12 @@ async def test_execute_event_already_executed(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SECRET", "test_scheduler_secret")
     event = {
         "id": "event_123",
         "user_id": "user_test",
         "event_type": "checkin",
-        "payload": {"reason": "deep_work"},
+        "payload": {"reason": "deep_work", "timezone": "America/New_York"},
         "executed": False,
         "cron_job_id": 98765,
     }
@@ -121,7 +134,10 @@ async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
     monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
     monkeypatch.setattr(main, "send_push_notification", send_push_mock)
 
-    response = await api_client.post("/api/execute-event/event_123")
+    response = await api_client.post(
+        "/api/execute-event/event_123",
+        headers=_scheduler_headers(),
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -142,6 +158,7 @@ async def test_execute_event_processes_and_cleans_up(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SECRET", "test_scheduler_secret")
     event = {
         "id": "event_retry",
         "user_id": "user_test",
@@ -166,7 +183,10 @@ async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
     monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
     monkeypatch.setattr(main, "send_push_notification", send_push_mock)
 
-    response = await api_client.post("/api/execute-event/event_retry")
+    response = await api_client.post(
+        "/api/execute-event/event_retry",
+        headers=_scheduler_headers(),
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -183,6 +203,7 @@ async def test_execute_event_failure_marks_last_error(api_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_calendar_reminder_missing_timezone_skips_push(api_client, monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SECRET", "test_scheduler_secret")
     event = {
         "id": "event_missing_tz",
         "user_id": "user_test",
@@ -208,7 +229,10 @@ async def test_execute_calendar_reminder_missing_timezone_skips_push(api_client,
     monkeypatch.setattr(main.cron_service, "delete_job", delete_job_mock)
     monkeypatch.setattr(main, "send_push_notification", send_push_mock)
 
-    response = await api_client.post("/api/execute-event/event_missing_tz")
+    response = await api_client.post(
+        "/api/execute-event/event_missing_tz",
+        headers=_scheduler_headers(),
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -218,6 +242,14 @@ async def test_execute_calendar_reminder_missing_timezone_skips_push(api_client,
     update_event_mock.assert_awaited_once()
     assert update_event_mock.await_args.kwargs["last_error"] == "missing_timezone"
     delete_job_mock.assert_awaited_once_with(22222)
+
+
+@pytest.mark.asyncio
+async def test_execute_event_rejects_missing_scheduler_secret(api_client, monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SECRET", "test_scheduler_secret")
+    response = await api_client.post("/api/execute-event/event_missing")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "unauthorized_scheduler_request"
 
 
 @pytest.mark.asyncio

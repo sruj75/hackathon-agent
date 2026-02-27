@@ -81,6 +81,7 @@ async def complete_onboarding(
             "onboarding_status": result["onboarding_status"],
             "onboarding_completed_at": result["onboarding_completed_at"],
             "route_hint": result["route_hint"],
+            "handoff_to_main": bool(result.get("handoff_to_main")),
             "scheduler": result["scheduler"],
             "message": "Onboarding completed successfully.",
         }

@@ -10,10 +10,31 @@ type EventRow = {
   payload: Record<string, unknown>;
   executed: boolean;
   cron_job_id: number | null;
+  scheduled_time?: string | null;
 };
 
-function getDailySessionId(userId: string): string {
-  const day = new Date().toISOString().slice(0, 10);
+function localDateKey(timezoneName: string | null): string {
+  if (!timezoneName) return "";
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezoneName,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date());
+    const year = parts.find((p) => p.type === "year")?.value;
+    const month = parts.find((p) => p.type === "month")?.value;
+    const day = parts.find((p) => p.type === "day")?.value;
+    if (year && month && day) return `${year}-${month}-${day}`;
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function getDailySessionId(userId: string, timezoneName: string | null): string {
+  const day = localDateKey(timezoneName);
+  if (!day) return "";
   return `session_${userId}_${day}`;
 }
 
@@ -115,6 +136,22 @@ async function ensureNextMorningWake(
   return { ok: true, detail: result.data ?? null };
 }
 
+async function resolveSessionTimezone(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  payload: Record<string, unknown>,
+  calendarTimezone: string | null,
+): Promise<string | null> {
+  if (calendarTimezone) return calendarTimezone;
+  const payloadTimezone = asString(payload.timezone);
+  if (payloadTimezone) return payloadTimezone;
+  const tzResult = await supabase.rpc("get_user_timezone_for_execution", {
+    p_user_id: userId,
+  });
+  if (tzResult.error) return null;
+  return asString(tzResult.data);
+}
+
 Deno.serve(async (req: Request): Promise<Response> => {
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? Deno.env.get("SUPABASE_PROJECT_URL");
@@ -204,9 +241,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
       }
     }
 
+    const sessionTimezone = await resolveSessionTimezone(
+      supabase,
+      eventUserId,
+      eventPayload,
+      calendarTimezone,
+    );
     const reason = asString(eventPayload.reason) ?? "scheduled_checkin";
     const triggerType = asString(eventPayload.trigger_type) ?? eventType;
     const calendarEventId = asString(eventPayload.calendar_event_id);
+    const sessionId = getDailySessionId(eventUserId, sessionTimezone);
 
     let title = "Check-in";
     let body = "You have a scheduled check-in.";
@@ -223,22 +267,59 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
 
     const notificationData: Record<string, unknown> = {
-      session_id: getDailySessionId(eventUserId),
+      session_id: sessionId,
       type: eventType,
       trigger_type: triggerType,
       event_id: eventId,
       user_id: eventUserId,
+      source: "push",
+      entry_mode: "proactive",
+      scheduled_time: asString(event.scheduled_time),
     };
     if (calendarEventId) notificationData.calendar_event_id = calendarEventId;
 
     let pushSent = false;
-    if (!(eventType === "calendar_reminder" && !calendarTimezone)) {
+    if (!sessionTimezone || !sessionId) {
+      pushSent = false;
+    } else if (!(eventType === "calendar_reminder" && !calendarTimezone)) {
       pushSent = await sendPushNotification(supabase, eventUserId, title, body, notificationData);
     }
 
     let lastError: string | null = pushSent ? null : "push_failed_or_missing_token";
-    if (eventType === "calendar_reminder" && !calendarTimezone) {
+    if (!sessionTimezone || !sessionId) {
       lastError = "missing_timezone";
+    } else if (eventType === "calendar_reminder" && !calendarTimezone) {
+      lastError = "missing_timezone";
+    }
+
+    let nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null = null;
+    if (eventType === "morning_wake") {
+      nextMorningWake = await ensureNextMorningWake(supabase, eventId);
+      if (!nextMorningWake.ok) {
+        const failedFinalize = await supabase.rpc("finalize_event_execution", {
+          p_event_id: eventId,
+          p_last_error: "morning_wake_continuation_failed",
+          p_attempted_at: new Date().toISOString(),
+          p_executed: false,
+        });
+        if (failedFinalize.error) {
+          return new Response(
+            JSON.stringify({ error: `finalize failed: ${failedFinalize.error.message}` }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
+        return new Response(
+          JSON.stringify({
+            error: "Failed to schedule next morning wake",
+            event_id: eventId,
+            event_type: eventType,
+            push_sent: pushSent,
+            next_morning_wake: nextMorningWake,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
     }
 
     const finalize = await supabase.rpc("finalize_event_execution", {
@@ -252,11 +333,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
         JSON.stringify({ error: `finalize failed: ${finalize.error.message}` }),
         { status: 500, headers: { "Content-Type": "application/json" } },
       );
-    }
-
-    let nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null = null;
-    if (eventType === "morning_wake") {
-      nextMorningWake = await ensureNextMorningWake(supabase, eventId);
     }
 
     await unscheduleIfPresent(supabase, event.cron_job_id ?? null);

@@ -88,20 +88,25 @@ class _FakeWebSocket:
 @pytest.mark.regression
 class TestPhase6WebSocketFlow:
     def test_select_ws_session_id_uses_requested_when_valid(self):
+        today_session_id = ADKSessionManager.get_daily_session_id("user_test", "UTC")
         selected = main._select_ws_session_id(
-            "user_test", "session_user_test_2026-02-06"
+            "user_test",
+            today_session_id,
+            timezone_name="UTC",
         )
-        assert selected == "session_user_test_2026-02-06"
+        assert selected == today_session_id
 
     def test_select_ws_session_id_rejects_invalid_or_wrong_user(self):
-        fallback = ADKSessionManager.get_daily_session_id("user_test")
+        fallback = ADKSessionManager.get_daily_session_id("user_test", "UTC")
         assert (
-            main._select_ws_session_id("user_test", "client_random_session")
+            main._select_ws_session_id(
+                "user_test", "client_random_session", timezone_name="UTC"
+            )
             == fallback
         )
         assert (
             main._select_ws_session_id(
-                "user_test", "session_other_user_2026-02-06"
+                "user_test", "session_other_user_2026-02-06", timezone_name="UTC"
             )
             == fallback
         )
@@ -146,6 +151,9 @@ class TestPhase6WebSocketFlow:
             ),
         )
 
+        expected_session_id = ADKSessionManager.get_daily_session_id(
+            "user_test", "America/New_York"
+        )
         ws = _FakeWebSocket(
             [
                 {
@@ -153,7 +161,7 @@ class TestPhase6WebSocketFlow:
                         {
                             "type": "init",
                             "access_token": "jwt_test",
-                            "resume_session_id": "session_user_test_2026-02-06",
+                            "resume_session_id": expected_session_id,
                             "trigger_type": "checkin",
                             "timezone": "America/New_York",
                         }
@@ -165,7 +173,6 @@ class TestPhase6WebSocketFlow:
 
         await main.websocket_endpoint(ws, "client_random_session")
 
-        expected_session_id = "session_user_test_2026-02-06"
         assert ws.accepted is True
         assert fake_session.state["trigger_type"] == "checkin"
         assert fake_session.state["user_timezone"] == "America/New_York"
@@ -213,6 +220,7 @@ class TestPhase6WebSocketFlow:
             ),
         )
 
+        expected_session_id = ADKSessionManager.get_daily_session_id("user_test", "UTC")
         ws = _FakeWebSocket(
             [
                 {
@@ -224,12 +232,12 @@ class TestPhase6WebSocketFlow:
             ]
         )
 
-        await main.websocket_endpoint(ws, "session_user_test_2026-02-06")
+        await main.websocket_endpoint(ws, expected_session_id)
 
         get_or_create_mock.assert_awaited_with(
             app_name=main.APP_NAME,
             user_id="user_test",
-            session_id="session_user_test_2026-02-06",
+            session_id=expected_session_id,
         )
 
     @pytest.mark.asyncio
