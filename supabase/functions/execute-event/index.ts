@@ -101,6 +101,20 @@ async function unscheduleIfPresent(
   }
 }
 
+async function ensureNextMorningWake(
+  supabase: ReturnType<typeof createClient>,
+  eventId: string,
+): Promise<{ ok: boolean; detail?: unknown; error?: string }> {
+  const result = await supabase.rpc("ensure_next_morning_wake_event", {
+    p_event_id: eventId,
+  });
+  if (result.error) {
+    console.warn("ensure_next_morning_wake_event failed", result.error.message);
+    return { ok: false, error: result.error.message };
+  }
+  return { ok: true, detail: result.data ?? null };
+}
+
 Deno.serve(async (req: Request): Promise<Response> => {
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? Deno.env.get("SUPABASE_PROJECT_URL");
@@ -240,6 +254,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
       );
     }
 
+    let nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null = null;
+    if (eventType === "morning_wake") {
+      nextMorningWake = await ensureNextMorningWake(supabase, eventId);
+    }
+
     await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
 
     return new Response(
@@ -248,6 +267,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         event_id: eventId,
         event_type: eventType,
         push_sent: pushSent,
+        next_morning_wake: nextMorningWake,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
