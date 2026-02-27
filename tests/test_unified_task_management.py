@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -69,7 +70,7 @@ def test_full_workflow_live_smoke():
             pending_result, test_task_title
         ), "New task not found in pending tasks"
 
-        now_local = datetime.now()
+        now_local = datetime.now(ZoneInfo(live_timezone))
         start_time = f"{now_local.hour:02d}:{now_local.minute:02d}"
         timeblock_result = task_management(
             "timeblock_task",

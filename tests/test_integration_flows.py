@@ -59,9 +59,13 @@ def in_memory_event_repo(monkeypatch):
         return job_id
 
     async def unschedule_event_job(job_id: int | None) -> bool:
-        if not job_id:
+        if job_id is None:
             return False
-        return int(job_id) in scheduled_jobs
+        jid = int(job_id)
+        if jid in scheduled_jobs:
+            scheduled_jobs.discard(jid)
+            return True
+        return False
 
     monkeypatch.setattr(event_repo, "create_event", create_event)
     monkeypatch.setattr(event_repo, "update_cron_job_id", update_cron_job_id)

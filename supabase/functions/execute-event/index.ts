@@ -81,28 +81,54 @@ async function sendPushNotification(
   const pushToken = asString(tokenResult.data);
   if (!pushToken) return false;
 
-  const response = await fetch(EXPO_PUSH_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      to: pushToken,
-      title,
-      body,
-      data,
-      sound: "default",
-      priority: "high",
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  let response: Response;
+  try {
+    response = await fetch(EXPO_PUSH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        to: pushToken,
+        title,
+        body,
+        data,
+        sound: "default",
+        priority: "high",
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    console.error("Expo push request failed", error);
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
-  if (response.status !== 200) return false;
+  if (!response.ok) return false;
 
-  const result = await response.json();
+  let result: unknown;
+  try {
+    result = await response.json();
+  } catch (error) {
+    console.error("Failed to parse Expo push response JSON", error);
+    return false;
+  }
   const items = Array.isArray(result?.data) ? result.data : [];
   for (const item of items) {
     if (item?.status === "error") {
       const errorCode = item?.details?.error;
       if (errorCode === "DeviceNotRegistered") {
-        await supabase.rpc("delete_push_token_for_execution", { p_user_id: userId });
+        const deleteResult = await supabase.rpc("delete_push_token_for_execution", {
+          p_user_id: userId,
+        });
+        if (deleteResult.error) {
+          console.warn(
+            "delete_push_token_for_execution failed",
+            userId,
+            deleteResult.error.message,
+          );
+        }
       }
       return false;
     }
@@ -177,7 +203,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    const payload = await req.json().catch(() => ({}));
+    let payload: Record<string, unknown>;
+    try {
+      payload = await req.json();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Invalid JSON body";
+      return new Response(
+        JSON.stringify({ error: `Malformed JSON body: ${message}` }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
     const eventId = asString(payload?.event_id);
     if (!eventId) {
       return new Response(

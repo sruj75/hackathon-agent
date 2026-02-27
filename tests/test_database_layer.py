@@ -262,6 +262,7 @@ class FakeConnection:
                 value = args[idx]
                 if "::jsonb" in ref and isinstance(value, str):
                     value = json.loads(value)
+                col = col.replace("::jsonb", "")
                 row[col] = deepcopy(value)
             return "UPDATE 1"
 

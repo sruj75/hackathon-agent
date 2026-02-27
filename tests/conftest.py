@@ -13,7 +13,7 @@ os.makedirs(os.environ['COMPOSIO_CACHE_DIR'], exist_ok=True)
 
 @pytest.fixture
 def mock_cron_api(monkeypatch):
-    """Backward-compatible scheduler fixture for cron regression tests."""
+    """Mock scheduler fixture that patches event_repo scheduling methods."""
     schedule_mock = AsyncMock(return_value=12345)
     unschedule_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(cron_service.event_repo, "schedule_event_job", schedule_mock)

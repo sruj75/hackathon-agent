@@ -43,7 +43,7 @@ Conversation flow (in order):
 5) Close the onboarding:
    - Summarize back briefly in plain language.
    - Build a structured playbook JSON with keys:
-     schema_version, summary, struggles (array), goals (array), communication_style.
+     schema_version (use "1.0"), summary, struggles (array), goals (array), communication_style.
    - Minimum completion quality:
      - summary must be non-empty
      - struggles must include at least one concrete challenge

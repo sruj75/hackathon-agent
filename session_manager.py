@@ -173,7 +173,8 @@ class ADKSessionManager:
                     timezone_name,
                 )
         if resolved_tz is None:
-            today = datetime.now().astimezone().date().isoformat()
+            local_tz = datetime.now().astimezone().tzinfo
+            today = now.astimezone(local_tz).date().isoformat()
         else:
             today = now.astimezone(resolved_tz).date().isoformat()
         return f"session_{user_id}_{today}"

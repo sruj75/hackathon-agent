@@ -58,7 +58,7 @@ async def delete_job(job_id: int | None) -> bool:
     """
     Unschedule an existing pg_cron job by job id.
     """
-    if not job_id:
+    if job_id is None:
         logger.warning("No job_id provided, skipping deletion")
         return False
 

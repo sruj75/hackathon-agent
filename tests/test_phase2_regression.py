@@ -5,7 +5,7 @@ Goal: retain concise coverage for phase-2 architecture contracts:
 context vars, cron wiring, event lifecycle, and runtime interfaces.
 """
 import inspect
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -49,7 +49,7 @@ async def test_phase2_cron_create_and_delete(monkeypatch):
 async def test_phase2_cron_missing_timezone_errors_cleanly():
     with pytest.raises(ValueError, match="missing_timezone"):
         await cron_service.create_one_time_job(
-            target_datetime=datetime.utcnow(),
+            target_datetime=datetime.now(timezone.utc),
             event_id="phase2_missing_timezone",
             timezone="",
         )

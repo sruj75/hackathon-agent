@@ -49,7 +49,10 @@ async def complete_onboarding(
     if not user_id:
         return {"status": "error", "error": "missing_user_context"}
 
-    timezone_name = current_user_timezone.get()
+    try:
+        timezone_name = current_user_timezone.get()
+    except LookupError:
+        timezone_name = None
     try:
         parsed = json.loads(playbook_json) if playbook_json else {}
     except json.JSONDecodeError:
@@ -77,12 +80,12 @@ async def complete_onboarding(
             health_anchors=None,
         )
         return {
-            "status": result["status"],
-            "onboarding_status": result["onboarding_status"],
-            "onboarding_completed_at": result["onboarding_completed_at"],
-            "route_hint": result["route_hint"],
+            "status": result.get("status"),
+            "onboarding_status": result.get("onboarding_status"),
+            "onboarding_completed_at": result.get("onboarding_completed_at"),
+            "route_hint": result.get("route_hint"),
             "handoff_to_main": bool(result.get("handoff_to_main")),
-            "scheduler": result["scheduler"],
+            "scheduler": result.get("scheduler"),
             "message": "Onboarding completed successfully.",
         }
     except ValueError as exc:

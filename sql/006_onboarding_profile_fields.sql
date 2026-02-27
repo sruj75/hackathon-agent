@@ -9,7 +9,8 @@ ALTER TABLE public.users
 -- continue going directly to the assistant if they already have complete
 -- scheduler preferences.
 UPDATE public.users
-SET onboarding_status = 'completed'
+SET onboarding_status = 'completed',
+    onboarding_completed_at = NOW()
 WHERE onboarding_status = 'pending'
   AND wake_time IS NOT NULL
   AND bedtime IS NOT NULL
