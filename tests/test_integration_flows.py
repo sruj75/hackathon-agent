@@ -10,6 +10,8 @@ import cron_service
 from repos import event_repo, session_repo
 from session_manager import ADKSessionManager
 
+TEST_TIMEZONE = "UTC"
+
 
 @pytest.fixture
 def in_memory_event_repo(monkeypatch):
@@ -117,7 +119,7 @@ def in_memory_session_repo(monkeypatch):
 
 async def _append_daily_checkpoint(user_id: str, trigger_context: str, session_manager):
     """Append one checkpoint into the user's daily persisted session."""
-    session_id = ADKSessionManager.get_daily_session_id(user_id)
+    session_id = ADKSessionManager.get_daily_session_id(user_id, TEST_TIMEZONE)
     session = await session_manager.get_or_create_session(
         app_name="intentive-coach",
         user_id=user_id,
@@ -254,7 +256,7 @@ class TestSessionContinuity:
 
         with freeze_time("2026-02-04 08:00:00"):
             manager1 = ADKSessionManager()
-            session_id = ADKSessionManager.get_daily_session_id(user_id)
+            session_id = ADKSessionManager.get_daily_session_id(user_id, TEST_TIMEZONE)
 
             session = await manager1.get_or_create_session(
                 app_name="test_app",
@@ -308,7 +310,7 @@ class TestSessionContinuity:
 
         with freeze_time("2026-02-04"):
             manager = ADKSessionManager()
-            session_id = ADKSessionManager.get_daily_session_id(user_id)
+            session_id = ADKSessionManager.get_daily_session_id(user_id, TEST_TIMEZONE)
 
             with freeze_time("2026-02-04 08:00:00"):
                 await _append_daily_checkpoint(
@@ -353,7 +355,7 @@ class TestFullDayCycle:
 
         with freeze_time("2026-02-04"):
             manager = ADKSessionManager()
-            session_id = ADKSessionManager.get_daily_session_id(user_id)
+            session_id = ADKSessionManager.get_daily_session_id(user_id, TEST_TIMEZONE)
 
             timeline = [
                 ("2026-02-04 08:00:00", "morning_wake", "Morning wake: 8:00 AM"),

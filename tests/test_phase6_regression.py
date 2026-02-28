@@ -15,6 +15,22 @@ import main
 from auth import AuthUser
 from session_manager import ADKSessionManager
 
+COMPLETED_PROFILE = {
+    "timezone": "UTC",
+    "wake_time": "07:30",
+    "bedtime": "22:30",
+    "onboarding_status": "completed",
+    "onboarding_completed_at": "2026-01-01T00:00:00+00:00",
+}
+
+PENDING_PROFILE = {
+    "timezone": "UTC",
+    "wake_time": None,
+    "bedtime": None,
+    "onboarding_status": "pending",
+    "onboarding_completed_at": None,
+}
+
 class _FakeContent:
     def __init__(self, parts=None, role=None):
         self.parts = parts or []
@@ -126,7 +142,7 @@ class TestPhase6WebSocketFlow:
             staticmethod(lambda: object()),
         )
         monkeypatch.setattr(
-            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(COMPLETED_PROFILE))
         )
         monkeypatch.setattr(
             main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -181,6 +197,76 @@ class TestPhase6WebSocketFlow:
         )
 
     @pytest.mark.asyncio
+    async def test_incomplete_onboarding_forces_onboarding_mode(self, monkeypatch):
+        fake_session = SimpleNamespace(state={})
+        get_or_create_mock = AsyncMock(return_value=fake_session)
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _FakeLiveRequestQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_realtime_run_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(PENDING_PROFILE))
+        )
+        monkeypatch.setattr(main.session_manager, "get_or_create_session", get_or_create_mock)
+        monkeypatch.setattr(
+            main.session_manager, "save_agent_session_to_db", AsyncMock(return_value=True)
+        )
+
+        async def fake_onboarding_run_live(**_kwargs):
+            if False:  # pragma: no cover
+                yield None
+
+        async def fail_if_main_runner_used(**_kwargs):
+            raise AssertionError("main runner should not be used for pending onboarding")
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.onboarding_runner, "run_live", fake_onboarding_run_live)
+        monkeypatch.setattr(main.main_runner, "run_live", fail_if_main_runner_used)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
+
+        ws = _FakeWebSocket(
+            [
+                {
+                    "text": json.dumps(
+                        {
+                            "type": "init",
+                            "access_token": "jwt_test",
+                            "trigger_type": "checkin",
+                        }
+                    )
+                },
+                {"type": "websocket.disconnect"},
+            ]
+        )
+
+        await main.websocket_endpoint(ws, "client_random_session")
+
+        assert ws.accepted is True
+        assert fake_session.state["agent_mode"] == "onboarding"
+        assert fake_session.state["trigger_type"] == "onboarding"
+        assert fake_session.state["lifecycle_state"] == main.LIFECYCLE_NEEDS_ONBOARDING
+        get_or_create_mock.assert_awaited_with(
+            app_name=main.APP_NAME,
+            user_id="user_test",
+            session_id="session_onboarding_user_test",
+        )
+
+    @pytest.mark.asyncio
     async def test_websocket_uses_valid_requested_session_id(self, monkeypatch):
         fake_session = SimpleNamespace(state={})
         get_or_create_mock = AsyncMock(return_value=fake_session)
@@ -195,7 +281,7 @@ class TestPhase6WebSocketFlow:
             staticmethod(lambda: object()),
         )
         monkeypatch.setattr(
-            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(COMPLETED_PROFILE))
         )
         monkeypatch.setattr(
             main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -254,7 +340,7 @@ class TestPhase6WebSocketFlow:
             staticmethod(lambda: object()),
         )
         monkeypatch.setattr(
-            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(COMPLETED_PROFILE))
         )
         monkeypatch.setattr(
             main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -332,7 +418,7 @@ class TestPhase6WebSocketFlow:
             staticmethod(lambda: object()),
         )
         monkeypatch.setattr(
-            main.user_repo, "get_profile", AsyncMock(return_value={"timezone": "UTC"})
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(COMPLETED_PROFILE))
         )
         monkeypatch.setattr(
             main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
@@ -603,3 +689,32 @@ class TestAutonomySchedulingBoundaries:
         await main.reliability_bootstrap()
 
         reconcile_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_startup_seeds_only_onboarding_complete_users(self, monkeypatch):
+        pending_user = {
+            "user_id": "u_pending",
+            "onboarding_status": "pending",
+            "timezone": "UTC",
+            "wake_time": None,
+        }
+        completed_user = {
+            "user_id": "u_complete",
+            "onboarding_status": "completed",
+            "timezone": "UTC",
+            "wake_time": "08:00",
+        }
+
+        get_all_users_mock = AsyncMock(return_value=[pending_user, completed_user])
+        ensure_wake_mock = AsyncMock(return_value=None)
+        reconcile_mock = AsyncMock(return_value=None)
+
+        monkeypatch.delenv("ENABLE_RELIABILITY_BOOTSTRAP", raising=False)
+        monkeypatch.delenv("ENABLE_MORNING_CRON_RECONCILE", raising=False)
+        monkeypatch.setattr(main.user_repo, "get_all_users", get_all_users_mock)
+        monkeypatch.setattr(main, "_ensure_morning_wake_for_user", ensure_wake_mock)
+        monkeypatch.setattr(main, "_reconcile_missing_cron_jobs", reconcile_mock)
+
+        await main.reliability_bootstrap()
+
+        ensure_wake_mock.assert_awaited_once_with(completed_user)

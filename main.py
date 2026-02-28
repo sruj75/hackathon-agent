@@ -126,6 +126,9 @@ APP_NAME = "intentive-coach"
 COMPOSIO_INTEGRATION_APPS = ("googlecalendar", "googletasks")
 ONBOARDING_STATUS_PENDING = "pending"
 ONBOARDING_STATUS_COMPLETED = "completed"
+LIFECYCLE_NEEDS_CONNECT_FLOW = "needs_connect_flow"
+LIFECYCLE_NEEDS_ONBOARDING = "needs_onboarding"
+LIFECYCLE_ACTIVE = "active"
 ENTRY_MODE_REACTIVE = "reactive"
 ENTRY_MODE_PROACTIVE = "proactive"
 ENTRY_MODE_POST_ONBOARDING = "post_onboarding"
@@ -299,6 +302,32 @@ def _normalize_onboarding_status(value: object) -> str:
     return ONBOARDING_STATUS_PENDING
 
 
+def _resolve_user_lifecycle_state(
+    *,
+    profile: dict | None,
+    all_connected: bool | None,
+) -> str:
+    """
+    Resolve lifecycle from server state.
+
+    `all_connected` may be unknown (None) in contexts where integration status is
+    not loaded; onboarding completeness remains authoritative in that case.
+    """
+    if all_connected is False:
+        return LIFECYCLE_NEEDS_CONNECT_FLOW
+    if _is_onboarding_complete(profile):
+        return LIFECYCLE_ACTIVE
+    return LIFECYCLE_NEEDS_ONBOARDING
+
+
+def _lifecycle_state_to_route_hint(lifecycle_state: str) -> str:
+    if lifecycle_state == LIFECYCLE_NEEDS_CONNECT_FLOW:
+        return "connect_flow"
+    if lifecycle_state == LIFECYCLE_NEEDS_ONBOARDING:
+        return "onboarding"
+    return "assistant"
+
+
 def _is_onboarding_complete(profile: dict | None) -> bool:
     if not profile:
         return False
@@ -379,10 +408,8 @@ def _select_ws_session_id(
     return requested_session_id
 
 
-def _use_onboarding_mode(trigger_type: object, profile: dict | None) -> bool:
-    return str(trigger_type or "").strip().lower() == "onboarding" and not _is_onboarding_complete(
-        profile
-    )
+def _use_onboarding_mode(lifecycle_state: str) -> bool:
+    return lifecycle_state == LIFECYCLE_NEEDS_ONBOARDING
 
 
 def _normalize_timezone(timezone_name: str | None) -> str | None:
@@ -845,11 +872,11 @@ async def _get_composio_status_payload(user_id: str) -> dict:
 
 
 def _bootstrap_route_hint(*, all_connected: bool, profile: dict | None) -> str:
-    if not all_connected:
-        return "connect_flow"
-    if _is_onboarding_complete(profile):
-        return "assistant"
-    return "onboarding"
+    lifecycle_state = _resolve_user_lifecycle_state(
+        profile=profile,
+        all_connected=all_connected,
+    )
+    return _lifecycle_state_to_route_hint(lifecycle_state)
 
 
 async def _complete_onboarding_workflow(
@@ -1396,8 +1423,13 @@ class AppLifecycle:
 
         try:
             users = await user_repo.get_all_users()
-            logger.info(f"[bootstrap] Seeding morning wake events for {len(users)} users")
-            for user in users:
+            eligible_users = [user for user in users if _is_onboarding_complete(user)]
+            logger.info(
+                "[bootstrap] Seeding morning wake events for %s/%s users (onboarding complete)",
+                len(eligible_users),
+                len(users),
+            )
+            for user in eligible_users:
                 try:
                     await _ensure_morning_wake_for_user(user)
                 except Exception as user_error:
@@ -1486,6 +1518,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             logger.warning("[WS-INIT] Failed to load profile for %s: %s", user_id, profile_error)
             profile = None
 
+        all_connected: bool | None = None
+        try:
+            composio_payload = await _get_composio_status_payload(user_id)
+            all_connected = bool(composio_payload.get("all_connected"))
+        except Exception as composio_status_error:
+            logger.warning(
+                "[WS-INIT] Failed to resolve integration status for %s: %s",
+                user_id,
+                composio_status_error,
+            )
+
+        lifecycle_state = _resolve_user_lifecycle_state(
+            profile=profile,
+            all_connected=all_connected,
+        )
+        if lifecycle_state == LIFECYCLE_NEEDS_CONNECT_FLOW:
+            await websocket.close(code=4403, reason="connect_flow_required")
+            return
+        onboarding_mode = _use_onboarding_mode(lifecycle_state)
+
         client_timezone = _normalize_timezone(init_message.get("timezone"))
         profile_timezone = _normalize_timezone((profile or {}).get("timezone"))
         resolved_timezone = client_timezone or profile_timezone
@@ -1507,8 +1559,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             entry_context["entry_mode"] = ENTRY_MODE_REACTIVE
             requested_session_id = None
 
-        onboarding_mode = _use_onboarding_mode(trigger_type, profile)
-
         if onboarding_mode:
             unified_session_id = _select_onboarding_session_id(user_id, requested_session_id)
         else:
@@ -1519,10 +1569,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             )
 
         logger.info(
-            "[WS-INIT] Authenticated websocket user=%s, session=%s, onboarding_mode=%s",
+            "[WS-INIT] Authenticated websocket user=%s, session=%s, onboarding_mode=%s, lifecycle_state=%s",
             user_id,
             unified_session_id,
             onboarding_mode,
+            lifecycle_state,
         )
 
         current_user_id.set(user_id)
@@ -1540,6 +1591,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         if effective_trigger_type:
             session.state["trigger_type"] = effective_trigger_type
         session.state["agent_mode"] = "onboarding" if onboarding_mode else "main"
+        session.state["lifecycle_state"] = lifecycle_state
         session.state["entry_mode"] = str(entry_context.get("entry_mode") or ENTRY_MODE_REACTIVE)
         session.state["entry_context"] = entry_context
 
