@@ -204,6 +204,83 @@ def _is_valid_hhmm(value: str | None) -> bool:
     return bool(value and HHMM_PATTERN.match(value))
 
 
+def _safe_model_dump(value: object) -> dict[str, Any]:
+    """Best-effort serialization for diagnostic logging."""
+    if isinstance(value, dict):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(by_alias=True, exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            return {}
+    return {}
+
+
+def _schema_has_additional_properties(schema: object) -> bool:
+    if isinstance(schema, dict):
+        return "additionalProperties" in schema or "additional_properties" in schema
+    return False
+
+
+def _log_live_setup_diagnostics(
+    *,
+    selected_agent: object,
+    run_config: object,
+    onboarding_mode: bool,
+    user_id: str,
+    session_id: str,
+) -> None:
+    """Emit compact diagnostics for Live setup payload shapes."""
+    run_config_dump = _safe_model_dump(run_config)
+    logger.info(
+        "[LIVE-DIAG] setup model=%s onboarding_mode=%s user=%s session=%s run_config_keys=%s",
+        getattr(selected_agent, "model", None),
+        onboarding_mode,
+        user_id,
+        session_id,
+        sorted(run_config_dump.keys()),
+    )
+
+    tools = getattr(selected_agent, "tools", None)
+    if not isinstance(tools, list):
+        logger.info("[LIVE-DIAG] setup tools unavailable type=%s", type(tools).__name__)
+        return
+
+    for idx, tool in enumerate(tools):
+        declaration = None
+        if hasattr(tool, "_get_declaration"):
+            try:
+                declaration = tool._get_declaration()  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.warning(
+                    "[LIVE-DIAG] setup tool idx=%s name=%s declaration_error=%s",
+                    idx,
+                    getattr(tool, "name", type(tool).__name__),
+                    exc,
+                )
+                continue
+
+        declaration_dump = _safe_model_dump(declaration)
+        params_schema = declaration_dump.get("parametersJsonSchema")
+        response_schema = declaration_dump.get("responseJsonSchema")
+        logger.info(
+            "[LIVE-DIAG] tool idx=%s name=%s type=%s decl_keys=%s params_schema_keys=%s "
+            "response_schema_keys=%s params_has_additional_properties=%s "
+            "response_has_additional_properties=%s",
+            idx,
+            declaration_dump.get("name", getattr(tool, "name", type(tool).__name__)),
+            type(tool).__name__,
+            sorted(declaration_dump.keys()),
+            sorted(params_schema.keys()) if isinstance(params_schema, dict) else [],
+            sorted(response_schema.keys()) if isinstance(response_schema, dict) else [],
+            _schema_has_additional_properties(params_schema),
+            _schema_has_additional_properties(response_schema),
+        )
+
+
 def _parse_wake_time(wake_time_raw: str | None) -> tuple[int, int] | None:
     """Parse HH:MM wake-time strings. Returns None when missing/invalid."""
     if not wake_time_raw:
@@ -1478,6 +1555,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     session = None
     live_request_queue = LiveRequestQueue()
     ui_event_queue = asyncio.Queue()
+    live_event_count = 0
+    seen_function_call_ids: dict[str, str] = {}
+    seen_function_response_ids: set[str] = set()
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
 
@@ -1677,6 +1757,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
         async def _process_downstream_event(event) -> bool:
             """Process one ADK event and forward to frontend. Returns False on closed socket."""
+            nonlocal live_event_count
+            live_event_count += 1
             if hasattr(event, "server_content") and event.server_content:
                 if (
                     hasattr(event.server_content, "input_transcription")
@@ -1706,11 +1788,62 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     if part_attrs:
                         logger.info("[MAIN-EVENT] Part %s has: %s", i, part_attrs)
 
+                    func_call = getattr(part, "function_call", None)
+                    if func_call is not None:
+                        call_id = getattr(func_call, "id", None)
+                        call_name = getattr(func_call, "name", "unknown")
+                        call_args = getattr(func_call, "args", None)
+                        arg_keys = sorted(call_args.keys()) if isinstance(call_args, dict) else []
+                        logger.info(
+                            "[LIVE-DIAG] function_call name=%s id=%s arg_keys=%s",
+                            call_name,
+                            call_id,
+                            arg_keys,
+                        )
+                        if isinstance(call_id, str) and call_id:
+                            seen_function_call_ids[call_id] = call_name
+                        else:
+                            logger.warning(
+                                "[LIVE-DIAG] function_call missing id name=%s",
+                                call_name,
+                            )
+
                     func_resp = getattr(part, "function_response", None)
                     if func_resp is None:
                         continue
                     func_name = getattr(func_resp, "name", "unknown")
+                    func_resp_id = getattr(func_resp, "id", None)
                     response_data = getattr(func_resp, "response", None)
+                    response_keys = (
+                        sorted(response_data.keys()) if isinstance(response_data, dict) else []
+                    )
+                    logger.info(
+                        "[LIVE-DIAG] function_response name=%s id=%s response_keys=%s",
+                        func_name,
+                        func_resp_id,
+                        response_keys,
+                    )
+                    if isinstance(func_resp_id, str) and func_resp_id:
+                        seen_function_response_ids.add(func_resp_id)
+                        if func_resp_id in seen_function_call_ids:
+                            logger.info(
+                                "[LIVE-DIAG] function_response matched_call id=%s call_name=%s response_name=%s",
+                                func_resp_id,
+                                seen_function_call_ids[func_resp_id],
+                                func_name,
+                            )
+                        else:
+                            logger.warning(
+                                "[LIVE-DIAG] function_response unmatched id=%s response_name=%s known_call_ids=%s",
+                                func_resp_id,
+                                func_name,
+                                sorted(seen_function_call_ids.keys()),
+                            )
+                    else:
+                        logger.warning(
+                            "[LIVE-DIAG] function_response missing id name=%s",
+                            func_name,
+                        )
                     if func_name == "generative_ui" and isinstance(response_data, dict):
                         ui_payload = response_data.get("ui_payload")
                         if ui_payload:
@@ -1751,6 +1884,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             selected_runner = onboarding_runner if onboarding_mode else main_runner
             selected_agent = onboarding_agent if onboarding_mode else main_agent
             model_name = str(selected_agent.model)
+            if user_id and unified_session_id:
+                _log_live_setup_diagnostics(
+                    selected_agent=selected_agent,
+                    run_config=run_config,
+                    onboarding_mode=onboarding_mode,
+                    user_id=user_id,
+                    session_id=unified_session_id,
+                )
             logger.info("[LIVE] Attempting run_live with conversation model: %s", model_name)
 
             for attempt in range(1, max_retries + 1):
@@ -1783,11 +1924,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         await asyncio.sleep(backoff_seconds)
                         continue
                     if "request contains an invalid argument" in str(e).lower():
+                        unmatched_response_ids = sorted(
+                            seen_function_response_ids - set(seen_function_call_ids.keys())
+                        )
                         logger.error(
                             "[LIVE] Gemini Live rejected request as invalid argument. "
                             "Verify model id and request payload schema. model=%s error=%s",
                             model_name,
                             e,
+                        )
+                        logger.error(
+                            "[LIVE-DIAG] invalid-argument context events_seen=%s call_ids=%s "
+                            "response_ids=%s unmatched_response_ids=%s",
+                            live_event_count,
+                            sorted(seen_function_call_ids.keys()),
+                            sorted(seen_function_response_ids),
+                            unmatched_response_ids,
                         )
                     raise
 
