@@ -86,12 +86,24 @@ async def _get_jwks_by_kid(kid: str) -> dict[str, Any]:
             payload = response.json()
         except httpx.HTTPStatusError as exc:
             logger.warning("JWKS fetch failed with status %s", exc.response.status_code)
+            if kid in cached_keys:
+                logger.warning(
+                    "Using stale cached JWKS key after HTTP status failure for kid=%s",
+                    kid,
+                )
+                return cached_keys[kid]
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unable to verify token",
             ) from exc
         except httpx.RequestError as exc:
             logger.warning("JWKS fetch request failed: %s", exc)
+            if kid in cached_keys:
+                logger.warning(
+                    "Using stale cached JWKS key after request failure for kid=%s",
+                    kid,
+                )
+                return cached_keys[kid]
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unable to verify token",

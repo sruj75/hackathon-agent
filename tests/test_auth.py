@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import time
+import httpx
 from unittest.mock import AsyncMock
 
 import jwt
@@ -327,3 +328,55 @@ async def test_anomalous_jwk_mismatch_logs_at_warning(monkeypatch, caplog):
         and "JWT/JWK algorithm mismatch" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_jwks_by_kid_uses_stale_cached_key_when_refresh_returns_http_error(monkeypatch):
+    _set_auth_env(monkeypatch)
+    _, jwk = _es256_keypair_and_jwk(kid="kid_stale")
+    auth._JWKS_CACHE["keys"] = {"kid_stale": jwk}
+    auth._JWKS_CACHE["expires_at"] = 0.0
+
+    class _FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, _url):
+            request = httpx.Request("GET", "https://project.supabase.co/auth/v1/.well-known/jwks.json")
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+    monkeypatch.setattr(auth.httpx, "AsyncClient", lambda **_kwargs: _FailingClient())
+
+    resolved = await auth._get_jwks_by_kid("kid_stale")
+
+    assert resolved == jwk
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_jwks_by_kid_raises_when_no_cached_key_and_refresh_fails(monkeypatch):
+    _set_auth_env(monkeypatch)
+
+    class _FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, _url):
+            request = httpx.Request("GET", "https://project.supabase.co/auth/v1/.well-known/jwks.json")
+            raise httpx.RequestError("network down", request=request)
+
+    monkeypatch.setattr(auth.httpx, "AsyncClient", lambda **_kwargs: _FailingClient())
+
+    with pytest.raises(HTTPException) as exc:
+        await auth._get_jwks_by_kid("kid_missing")
+
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "Unable to verify token"

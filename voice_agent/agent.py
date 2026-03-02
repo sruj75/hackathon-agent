@@ -1,8 +1,9 @@
 """
 Intentive realtime conversation agent.
 """
-from google.adk.agents import Agent
 import logging
+
+from google.adk.agents import Agent
 
 from .composio_tools import task_management
 from .get_time import get_current_time
@@ -11,7 +12,7 @@ from .render_ui_tools import generative_ui
 logger = logging.getLogger(__name__)
 
 AGENT_NAME = "intentive_planner"
-CONVERSATION_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
+CONVERSATION_MODEL = "gemini-live-2.5-flash-preview"
 
 CONVERSATION_INSTRUCTION = """You are Intentive, a realtime ADHD support assistant.
 The user is live in the app and can hear you.

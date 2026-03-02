@@ -1,15 +1,16 @@
 """
 Intentive onboarding voice agent.
 """
-from google.adk.agents import Agent
 import logging
+
+from google.adk.agents import Agent
 
 from .onboarding_tools import complete_onboarding, get_onboarding_context
 
 logger = logging.getLogger(__name__)
 
 ONBOARDING_AGENT_NAME = "intentive_onboarding"
-ONBOARDING_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
+ONBOARDING_MODEL = "gemini-live-2.5-flash-preview"
 
 ONBOARDING_INSTRUCTION = """You are the onboarding conversation for the Intentive platform.
 

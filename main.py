@@ -1657,7 +1657,20 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         continue
 
                     if json_message.get("type") == "text":
-                        content = types.Content(parts=[types.Part(text=json_message["text"])])
+                        text_payload = json_message.get("text")
+                        if not isinstance(text_payload, str):
+                            logger.warning(
+                                "Ignoring invalid text payload type: %s",
+                                type(text_payload).__name__,
+                            )
+                            continue
+                        text_payload = text_payload.strip()
+                        if not text_payload:
+                            continue
+                        content = types.Content(
+                            role="user",
+                            parts=[types.Part(text=text_payload)],
+                        )
                         live_request_queue.send_content(content)
             except Exception as e:
                 logger.debug("upstream_task ended: %s", e)
@@ -1769,6 +1782,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         )
                         await asyncio.sleep(backoff_seconds)
                         continue
+                    if "request contains an invalid argument" in str(e).lower():
+                        logger.error(
+                            "[LIVE] Gemini Live rejected request as invalid argument. "
+                            "Verify model id and request payload schema. model=%s error=%s",
+                            model_name,
+                            e,
+                        )
                     raise
 
         async def ui_event_task() -> None:

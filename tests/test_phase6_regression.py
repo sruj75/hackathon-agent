@@ -56,11 +56,15 @@ class _FakeBlob:
 class _FakeLiveRequestQueue:
     def __init__(self):
         self.closed = False
+        self.contents = []
+        self.realtime_blobs = []
 
     def send_content(self, _content):
+        self.contents.append(_content)
         return None
 
     def send_realtime(self, _blob):
+        self.realtime_blobs.append(_blob)
         return None
 
     def close(self):
@@ -471,6 +475,67 @@ class TestPhase6WebSocketFlow:
         )
         assert any(message.get("turnComplete") is True for message in parsed_messages)
         assert save_session_mock.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_text_payload_is_ignored_without_breaking_session(self, monkeypatch):
+        fake_session = SimpleNamespace(state={})
+        queue_holder = {}
+
+        class _CapturingQueue(_FakeLiveRequestQueue):
+            def __init__(self):
+                super().__init__()
+                queue_holder["queue"] = self
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _CapturingQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_realtime_run_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(COMPLETED_PROFILE))
+        )
+        monkeypatch.setattr(
+            main.user_repo, "update_profile", AsyncMock(return_value={"timezone": "UTC"})
+        )
+        monkeypatch.setattr(
+            main.session_manager, "get_or_create_session", AsyncMock(return_value=fake_session)
+        )
+        monkeypatch.setattr(
+            main.session_manager, "save_agent_session_to_db", AsyncMock(return_value=True)
+        )
+
+        async def fake_run_live(**_kwargs):
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.runner, "run_live", fake_run_live)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
+
+        ws = _FakeWebSocket(
+            [
+                {"text": json.dumps({"type": "init", "access_token": "jwt_test"})},
+                {"text": json.dumps({"type": "text", "text": {"not": "a string"}})},
+                {"type": "websocket.disconnect"},
+            ]
+        )
+
+        await main.websocket_endpoint(ws, "client_random_session")
+
+        queue = queue_holder["queue"]
+        # Activation prompt is always the first content event.
+        assert len(queue.contents) == 1
 
 
 @pytest.mark.regression
