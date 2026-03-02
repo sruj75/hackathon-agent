@@ -5,12 +5,13 @@ import logging
 
 from google.adk.agents import Agent
 
+from .json_schema_function_tool import JsonSchemaFunctionTool
 from .onboarding_tools import complete_onboarding, get_onboarding_context
 
 logger = logging.getLogger(__name__)
 
 ONBOARDING_AGENT_NAME = "intentive_onboarding"
-ONBOARDING_MODEL = "gemini-live-2.5-flash-preview"
+ONBOARDING_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
 
 ONBOARDING_INSTRUCTION = """You are the onboarding conversation for the Intentive platform.
 
@@ -70,8 +71,8 @@ Hard constraints:
 """
 
 ONBOARDING_TOOLS = [
-    get_onboarding_context,
-    complete_onboarding,
+    JsonSchemaFunctionTool(get_onboarding_context),
+    JsonSchemaFunctionTool(complete_onboarding),
 ]
 
 onboarding_agent = Agent(

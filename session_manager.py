@@ -1,5 +1,6 @@
 from typing import Optional, Dict, Any
 import logging
+import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from google.adk.sessions import InMemorySessionService, Session
@@ -133,6 +134,23 @@ class ADKSessionManager:
                 if isinstance(db_session, dict)
                 else getattr(db_session, "state", {})
             )
+            if isinstance(restored_state, str):
+                try:
+                    decoded = json.loads(restored_state)
+                    restored_state = decoded if isinstance(decoded, dict) else {}
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Session %s has invalid JSON state string; starting with empty state",
+                        session_id,
+                    )
+                    restored_state = {}
+            if not isinstance(restored_state, dict):
+                logger.warning(
+                    "Session %s has non-object state (%s); starting with empty state",
+                    session_id,
+                    type(restored_state).__name__,
+                )
+                restored_state = {}
             session = await self.service.create_session(
                 app_name=app_name,
                 user_id=user_id,
