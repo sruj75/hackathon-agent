@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -1558,6 +1559,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     live_event_count = 0
     seen_function_call_ids: dict[str, str] = {}
     seen_function_response_ids: set[str] = set()
+    ws_opened_at = time.monotonic()
+    audio_chunk_count = 0
+    audio_total_bytes = 0
+    audio_zero_chunks = 0
+    audio_odd_chunks = 0
+    first_audio_chunk_size: int | None = None
+    first_audio_sent_at: float | None = None
+    activity_started = False
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
 
@@ -1659,6 +1668,25 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         current_user_id.set(user_id)
         current_session_id.set(unified_session_id)
 
+        if onboarding_mode:
+            # Onboarding is a short, guided flow. Reusing in-memory ADK event history
+            # across reconnects can make Live setup brittle. Keep DB-backed state, but
+            # reset transient in-memory session history before each onboarding connect.
+            try:
+                await session_manager.service.delete_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=unified_session_id,
+                )
+                logger.warning(
+                    "[LIVE-DIAG] cleared in-memory onboarding session history user=%s session=%s",
+                    user_id,
+                    unified_session_id,
+                )
+            except Exception:
+                # Session may not exist in memory yet; safe to ignore.
+                pass
+
         session = await session_manager.get_or_create_session(
             app_name=APP_NAME,
             user_id=user_id,
@@ -1710,6 +1738,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         async def upstream_task() -> None:
             """Receives messages from WebSocket and sends to LiveRequestQueue."""
             logger.debug("upstream_task started")
+            nonlocal audio_chunk_count
+            nonlocal audio_total_bytes
+            nonlocal audio_zero_chunks
+            nonlocal audio_odd_chunks
+            nonlocal first_audio_chunk_size
+            nonlocal first_audio_sent_at
+            nonlocal activity_started
             try:
                 while True:
                     message = await websocket.receive()
@@ -1719,6 +1754,38 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
                     audio_data = message.get("bytes")
                     if audio_data is not None:
+                        chunk_size = len(audio_data)
+                        audio_chunk_count += 1
+                        audio_total_bytes += chunk_size
+                        if first_audio_chunk_size is None:
+                            first_audio_chunk_size = chunk_size
+                            first_audio_sent_at = time.monotonic()
+                        if chunk_size == 0:
+                            audio_zero_chunks += 1
+                            logger.warning(
+                                "[LIVE-DIAG] dropping empty audio chunk idx=%s",
+                                audio_chunk_count,
+                            )
+                            continue
+                        if chunk_size % 2 != 0:
+                            audio_odd_chunks += 1
+                            logger.warning(
+                                "[LIVE-DIAG] dropping odd-sized PCM chunk idx=%s size=%s",
+                                audio_chunk_count,
+                                chunk_size,
+                            )
+                            continue
+                        if audio_chunk_count <= 3:
+                            logger.warning(
+                                "[LIVE-DIAG] audio_chunk idx=%s size=%s since_ws_open_ms=%s",
+                                audio_chunk_count,
+                                chunk_size,
+                                int((time.monotonic() - ws_opened_at) * 1000),
+                            )
+                        if not activity_started:
+                            live_request_queue.send_activity_start()
+                            activity_started = True
+                            logger.warning("[LIVE-DIAG] sent activity_start")
                         audio_blob = types.Blob(
                             mime_type="audio/pcm;rate=16000",
                             data=audio_data,
@@ -1754,6 +1821,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         live_request_queue.send_content(content)
             except Exception as e:
                 logger.debug("upstream_task ended: %s", e)
+            finally:
+                if activity_started:
+                    try:
+                        live_request_queue.send_activity_end()
+                        logger.warning("[LIVE-DIAG] sent activity_end")
+                    except Exception as activity_end_error:
+                        logger.warning(
+                            "[LIVE-DIAG] failed to send activity_end: %s",
+                            activity_end_error,
+                        )
 
         async def _process_downstream_event(event) -> bool:
             """Process one ADK event and forward to frontend. Returns False on closed socket."""
@@ -1935,11 +2012,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         )
                         logger.error(
                             "[LIVE-DIAG] invalid-argument context events_seen=%s call_ids=%s "
-                            "response_ids=%s unmatched_response_ids=%s",
+                            "response_ids=%s unmatched_response_ids=%s audio_chunks=%s "
+                            "audio_total_bytes=%s audio_zero_chunks=%s audio_odd_chunks=%s "
+                            "first_audio_chunk_size=%s first_audio_after_ws_open_ms=%s",
                             live_event_count,
                             sorted(seen_function_call_ids.keys()),
                             sorted(seen_function_response_ids),
                             unmatched_response_ids,
+                            audio_chunk_count,
+                            audio_total_bytes,
+                            audio_zero_chunks,
+                            audio_odd_chunks,
+                            first_audio_chunk_size,
+                            (
+                                int((first_audio_sent_at - ws_opened_at) * 1000)
+                                if first_audio_sent_at is not None
+                                else None
+                            ),
                         )
                     raise
 
