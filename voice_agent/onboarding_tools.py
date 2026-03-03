@@ -15,6 +15,30 @@ from onboarding_service import (
 logger = logging.getLogger(__name__)
 
 
+_MISSING_FIELD_MAP: dict[str, str] = {
+    "playbook.summary is required": "summary",
+    "playbook.struggles must contain at least one item": "struggles",
+    "playbook.goals must contain at least one item": "goals",
+    "playbook.communication_style is required": "communication_style",
+    "wake_time must be HH:MM in 24-hour format": "wake_time",
+    "bedtime must be HH:MM in 24-hour format": "bedtime",
+    "timezone is required and must be a valid IANA timezone": "timezone",
+    "timezone must be a valid IANA timezone": "timezone",
+}
+
+
+def _extract_missing_fields(error_text: str) -> list[str]:
+    if not error_text:
+        return []
+    tokens = [token.strip() for token in error_text.split(";") if token.strip()]
+    missing_fields: list[str] = []
+    for token in tokens:
+        field = _MISSING_FIELD_MAP.get(token)
+        if field and field not in missing_fields:
+            missing_fields.append(field)
+    return missing_fields
+
+
 async def get_onboarding_context() -> dict[str, Any]:
     """Return existing onboarding context for resuming incomplete sessions."""
     try:
@@ -67,7 +91,14 @@ async def complete_onboarding(
 
     playbook_errors = validate_playbook_for_completion(playbook)
     if playbook_errors:
-        return {"status": "error", "error": "; ".join(playbook_errors)}
+        error_message = "; ".join(playbook_errors)
+        return {
+            "status": "error",
+            "error": error_message,
+            "missing_fields": _extract_missing_fields(error_message),
+            "onboarding_status": "pending",
+            "route_hint": "onboarding",
+        }
 
     logger.info("[onboarding-tool] complete_onboarding start user=%s", user_id)
     try:
@@ -107,8 +138,19 @@ async def complete_onboarding(
             )
         return response
     except ValueError as exc:
-        logger.warning("[onboarding-tool] complete_onboarding validation_error user=%s error=%s", user_id, exc)
-        return {"status": "error", "error": str(exc)}
+        error_message = str(exc)
+        logger.warning(
+            "[onboarding-tool] complete_onboarding validation_error user=%s error=%s",
+            user_id,
+            error_message,
+        )
+        return {
+            "status": "error",
+            "error": error_message,
+            "missing_fields": _extract_missing_fields(error_message),
+            "onboarding_status": "pending",
+            "route_hint": "onboarding",
+        }
     except Exception as exc:
         logger.exception("Failed to complete onboarding for user=%s", user_id)
         return {"status": "error", "error": str(exc)}

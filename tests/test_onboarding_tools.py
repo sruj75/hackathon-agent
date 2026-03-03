@@ -121,6 +121,14 @@ async def test_complete_onboarding_rejects_incomplete_playbook(monkeypatch):
         assert "playbook.struggles must contain at least one item" in result["error"]
         assert "playbook.goals must contain at least one item" in result["error"]
         assert "playbook.communication_style is required" in result["error"]
+        assert result["missing_fields"] == [
+            "summary",
+            "struggles",
+            "goals",
+            "communication_style",
+        ]
+        assert result["onboarding_status"] == "pending"
+        assert result["route_hint"] == "onboarding"
         workflow_mock.assert_not_awaited()
     finally:
         current_user_id.reset(user_token)

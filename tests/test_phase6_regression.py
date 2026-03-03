@@ -458,6 +458,84 @@ class TestPhase6WebSocketFlow:
         assert completion_events[0]["route_hint"] == "assistant"
 
     @pytest.mark.asyncio
+    async def test_onboarding_completion_failure_emits_missing_fields_event(
+        self, monkeypatch
+    ):
+        fake_session = SimpleNamespace(state={})
+        save_session_mock = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _FakeLiveRequestQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_realtime_run_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(PENDING_PROFILE))
+        )
+        monkeypatch.setattr(
+            main.session_manager, "get_or_create_session", AsyncMock(return_value=fake_session)
+        )
+        monkeypatch.setattr(main.session_manager, "save_agent_session_to_db", save_session_mock)
+
+        function_response = SimpleNamespace(
+            name="complete_onboarding",
+            response={
+                "status": "error",
+                "error": "playbook.summary is required; playbook.goals must contain at least one item",
+                "missing_fields": ["summary", "goals"],
+                "onboarding_status": "pending",
+                "route_hint": "onboarding",
+            },
+        )
+        event = _FakeEvent(
+            parts=[_FakePart(function_response=function_response)],
+            payload={"content": {"parts": []}, "turnComplete": True},
+        )
+
+        async def fake_onboarding_run_live(**_kwargs):
+            yield event
+
+        async def fail_if_main_runner_used(**_kwargs):
+            raise AssertionError("main runner should not be used for pending onboarding")
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.onboarding_runner, "run_live", fake_onboarding_run_live)
+        monkeypatch.setattr(main.main_runner, "run_live", fail_if_main_runner_used)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
+
+        ws = _FakeWebSocket(
+            [
+                {"text": json.dumps({"type": "init", "access_token": "jwt_test"})},
+                {"type": "websocket.disconnect"},
+            ]
+        )
+
+        await main.websocket_endpoint(ws, "client_random_session")
+
+        parsed_messages = [json.loads(message) for message in ws.sent_texts]
+        failure_events = [
+            message
+            for message in parsed_messages
+            if message.get("type") == "onboarding_completion_failed"
+        ]
+        assert len(failure_events) == 1
+        assert failure_events[0]["missing_fields"] == ["summary", "goals"]
+        assert "playbook.summary is required" in failure_events[0]["message"]
+
+    @pytest.mark.asyncio
     async def test_websocket_uses_valid_requested_session_id(self, monkeypatch):
         fake_session = SimpleNamespace(state={})
         get_or_create_mock = AsyncMock(return_value=fake_session)

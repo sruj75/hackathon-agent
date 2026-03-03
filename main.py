@@ -1961,6 +1961,35 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                                 logger.info(
                                     "WebSocket closed while sending onboarding completion event"
                                 )
+                        elif completion_status == "error":
+                            raw_missing_fields = completion_payload.get("missing_fields")
+                            missing_fields = (
+                                [field for field in raw_missing_fields if isinstance(field, str)]
+                                if isinstance(raw_missing_fields, list)
+                                else []
+                            )
+                            failure_message = str(
+                                completion_payload.get("error")
+                                or completion_payload.get("message")
+                                or "Onboarding could not be completed yet."
+                            )
+                            onboarding_failure_event = {
+                                "type": "onboarding_completion_failed",
+                                "message": failure_message,
+                                "missing_fields": missing_fields,
+                            }
+                            try:
+                                await websocket.send_text(json.dumps(onboarding_failure_event))
+                                logger.info(
+                                    "[onboarding] completion failed signal emitted user=%s session=%s missing_fields=%s",
+                                    user_id,
+                                    unified_session_id,
+                                    missing_fields,
+                                )
+                            except (RuntimeError, WebSocketDisconnect):
+                                logger.info(
+                                    "WebSocket closed while sending onboarding completion failure event"
+                                )
 
             event_json = event.model_dump_json(exclude_none=True, by_alias=True)
             try:
