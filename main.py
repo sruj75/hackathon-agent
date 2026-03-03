@@ -235,7 +235,7 @@ def _log_live_setup_diagnostics(
 ) -> None:
     """Emit compact diagnostics for Live setup payload shapes."""
     run_config_dump = _safe_model_dump(run_config)
-    logger.info(
+    logger.warning(
         "[LIVE-DIAG] setup model=%s onboarding_mode=%s user=%s session=%s run_config_keys=%s",
         getattr(selected_agent, "model", None),
         onboarding_mode,
@@ -246,7 +246,7 @@ def _log_live_setup_diagnostics(
 
     tools = getattr(selected_agent, "tools", None)
     if not isinstance(tools, list):
-        logger.info("[LIVE-DIAG] setup tools unavailable type=%s", type(tools).__name__)
+        logger.warning("[LIVE-DIAG] setup tools unavailable type=%s", type(tools).__name__)
         return
 
     for idx, tool in enumerate(tools):
@@ -266,7 +266,7 @@ def _log_live_setup_diagnostics(
         declaration_dump = _safe_model_dump(declaration)
         params_schema = declaration_dump.get("parametersJsonSchema")
         response_schema = declaration_dump.get("responseJsonSchema")
-        logger.info(
+        logger.warning(
             "[LIVE-DIAG] tool idx=%s name=%s type=%s decl_keys=%s params_schema_keys=%s "
             "response_schema_keys=%s params_has_additional_properties=%s "
             "response_has_additional_properties=%s",
