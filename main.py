@@ -1566,7 +1566,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     audio_odd_chunks = 0
     first_audio_chunk_size: int | None = None
     first_audio_sent_at: float | None = None
-    activity_started = False
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
 
@@ -1744,7 +1743,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             nonlocal audio_odd_chunks
             nonlocal first_audio_chunk_size
             nonlocal first_audio_sent_at
-            nonlocal activity_started
             try:
                 while True:
                     message = await websocket.receive()
@@ -1782,10 +1780,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                                 chunk_size,
                                 int((time.monotonic() - ws_opened_at) * 1000),
                             )
-                        if not activity_started:
-                            live_request_queue.send_activity_start()
-                            activity_started = True
-                            logger.warning("[LIVE-DIAG] sent activity_start")
                         audio_blob = types.Blob(
                             mime_type="audio/pcm;rate=16000",
                             data=audio_data,
@@ -1821,16 +1815,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         live_request_queue.send_content(content)
             except Exception as e:
                 logger.debug("upstream_task ended: %s", e)
-            finally:
-                if activity_started:
-                    try:
-                        live_request_queue.send_activity_end()
-                        logger.warning("[LIVE-DIAG] sent activity_end")
-                    except Exception as activity_end_error:
-                        logger.warning(
-                            "[LIVE-DIAG] failed to send activity_end: %s",
-                            activity_end_error,
-                        )
 
         async def _process_downstream_event(event) -> bool:
             """Process one ADK event and forward to frontend. Returns False on closed socket."""
