@@ -147,6 +147,11 @@ async def save_onboarding_progress_for_user(
 ) -> dict[str, Any]:
     profile = await user_repo.get_profile(user_id) or {}
     updates: dict[str, Any] = {}
+    existing_status = str(profile.get("onboarding_status") or "").strip().lower()
+    already_completed = (
+        existing_status == ONBOARDING_STATUS_COMPLETED
+        or profile.get("onboarding_completed_at") is not None
+    )
 
     if wake_time is not None:
         wake_time_clean = wake_time.strip()
@@ -197,8 +202,9 @@ async def save_onboarding_progress_for_user(
         merged_playbook["communication_style"] = normalized_style
 
     updates["playbook"] = merged_playbook
-    updates["onboarding_status"] = ONBOARDING_STATUS_PENDING
-    updates["onboarding_completed_at"] = None
+    if not already_completed:
+        updates["onboarding_status"] = ONBOARDING_STATUS_PENDING
+        updates["onboarding_completed_at"] = None
 
     await user_repo.update_profile(user_id, **updates)
     return await get_onboarding_context_for_user(user_id)

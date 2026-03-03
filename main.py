@@ -1572,6 +1572,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     onboarding_state_persist_saved_count = 0
     onboarding_state_persist_skipped_count = 0
     onboarding_completion_signal_sent = False
+    onboarding_completion_signal_pending = False
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
 
@@ -1810,6 +1811,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             nonlocal onboarding_state_persist_saved_count
             nonlocal onboarding_state_persist_skipped_count
             nonlocal onboarding_completion_signal_sent
+            nonlocal onboarding_completion_signal_pending
             live_event_count += 1
             has_audio_inline_part = False
             has_text_part = False
@@ -1944,23 +1946,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                             and completion_route_hint == "assistant"
                         )
                         if completion_success:
-                            onboarding_completion_signal_sent = True
-                            onboarding_complete_event = {
-                                "type": "onboarding_completed",
-                                "next_action": "show_done_screen",
-                                "route_hint": "assistant",
-                            }
-                            try:
-                                await websocket.send_text(json.dumps(onboarding_complete_event))
-                                logger.info(
-                                    "[onboarding] completion signal emitted user=%s session=%s",
-                                    user_id,
-                                    unified_session_id,
-                                )
-                            except (RuntimeError, WebSocketDisconnect):
-                                logger.info(
-                                    "WebSocket closed while sending onboarding completion event"
-                                )
+                            onboarding_completion_signal_pending = True
+                            logger.info(
+                                "[onboarding] completion signal pending user=%s session=%s",
+                                user_id,
+                                unified_session_id,
+                            )
                         elif completion_status == "error":
                             raw_missing_fields = completion_payload.get("missing_fields")
                             missing_fields = (
@@ -1998,35 +1989,67 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 logger.info("WebSocket connection closed, stopping downstream_task")
                 return False
 
+            payload_turn_complete = False
+            event_payload = getattr(event, "_payload", None)
+            if isinstance(event_payload, dict):
+                payload_turn_complete = bool(
+                    event_payload.get("turnComplete")
+                    or event_payload.get("turn_complete")
+                )
+            has_turn_complete = bool(
+                getattr(event, "turnComplete", False)
+                or getattr(event, "turn_complete", False)
+                or payload_turn_complete
+            )
+            if (
+                onboarding_mode
+                and onboarding_completion_signal_pending
+                and not onboarding_completion_signal_sent
+                and has_turn_complete
+            ):
+                onboarding_completion_signal_pending = False
+                onboarding_completion_signal_sent = True
+                onboarding_complete_event = {
+                    "type": "onboarding_completed",
+                    "next_action": "show_done_screen",
+                    "route_hint": "assistant",
+                }
+                try:
+                    await websocket.send_text(json.dumps(onboarding_complete_event))
+                    logger.info(
+                        "[onboarding] completion signal emitted user=%s session=%s",
+                        user_id,
+                        unified_session_id,
+                    )
+                except (RuntimeError, WebSocketDisconnect):
+                    logger.info(
+                        "WebSocket closed while sending onboarding completion event"
+                    )
+
             should_persist_state = True
-            if onboarding_mode:
-                now_mono = time.monotonic()
-                has_turn_complete = bool(
-                    getattr(event, "turnComplete", False)
-                    or getattr(event, "turn_complete", False)
-                )
-                has_interrupted = bool(getattr(event, "interrupted", False))
-                has_server_transcription = bool(
-                    getattr(getattr(event, "server_content", None), "input_transcription", None)
-                    or getattr(getattr(event, "server_content", None), "output_transcription", None)
-                )
-                force_persist = (
-                    has_turn_complete
-                    or has_interrupted
-                    or has_server_transcription
-                    or has_function_part
-                    or has_text_part
-                )
-                if (
-                    has_audio_inline_part
-                    and not force_persist
-                    and now_mono - last_onboarding_state_persist_at
-                    < ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS
-                ):
-                    should_persist_state = False
-                    onboarding_state_persist_skipped_count += 1
-                else:
-                    last_onboarding_state_persist_at = now_mono
+            now_mono = time.monotonic()
+            has_interrupted = bool(getattr(event, "interrupted", False))
+            has_server_transcription = bool(
+                getattr(getattr(event, "server_content", None), "input_transcription", None)
+                or getattr(getattr(event, "server_content", None), "output_transcription", None)
+            )
+            force_persist = (
+                has_turn_complete
+                or has_interrupted
+                or has_server_transcription
+                or has_function_part
+                or has_text_part
+            )
+            if (
+                has_audio_inline_part
+                and not force_persist
+                and now_mono - last_onboarding_state_persist_at
+                < ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS
+            ):
+                should_persist_state = False
+                onboarding_state_persist_skipped_count += 1
+            else:
+                last_onboarding_state_persist_at = now_mono
 
             if not should_persist_state:
                 return True
@@ -2039,8 +2062,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     session.state,
                     user_id=user_id,
                 )
-                if onboarding_mode:
-                    onboarding_state_persist_saved_count += 1
+                onboarding_state_persist_saved_count += 1
             except Exception as e:
                 logger.warning("Failed to persist session state: %s", e)
 
@@ -2148,13 +2170,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         except Exception as e:
             logger.error("Error in streaming: %s", e, exc_info=True)
     finally:
-        if onboarding_mode:
-            logger.warning(
-                "[LIVE-DIAG] onboarding_state_persist saved=%s skipped=%s interval_s=%s",
-                onboarding_state_persist_saved_count,
-                onboarding_state_persist_skipped_count,
-                ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS,
-            )
+        logger.warning(
+            "[LIVE-DIAG] state_persist mode=%s saved=%s skipped=%s interval_s=%s",
+            "onboarding" if onboarding_mode else "main",
+            onboarding_state_persist_saved_count,
+            onboarding_state_persist_skipped_count,
+            ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS,
+        )
         logger.info("Closing live_request_queue")
         live_request_queue.close()
         set_ui_event_queue(None)

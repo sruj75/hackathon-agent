@@ -152,6 +152,48 @@ async def test_save_onboarding_progress_for_user_validates_inputs(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_save_onboarding_progress_for_user_does_not_revert_completed_status(monkeypatch):
+    existing_profile = {
+        "user_id": "user_1",
+        "onboarding_status": onboarding_service.ONBOARDING_STATUS_COMPLETED,
+        "onboarding_completed_at": "2026-02-26T10:30:00+00:00",
+        "playbook": {
+            "schema_version": "1.0",
+            "created_at": "2026-02-26T10:30:00+00:00",
+            "summary": "Existing summary",
+            "struggles": ["procrastination"],
+            "goals": ["ship faster"],
+            "communication_style": "direct",
+        },
+    }
+    updated_profile = {
+        **existing_profile,
+        "wake_time": "07:45",
+        "bedtime": "22:15",
+    }
+
+    get_profile_mock = AsyncMock(side_effect=[existing_profile, updated_profile])
+    update_profile_mock = AsyncMock(return_value=updated_profile)
+    monkeypatch.setattr(onboarding_service.user_repo, "get_profile", get_profile_mock)
+    monkeypatch.setattr(onboarding_service.user_repo, "update_profile", update_profile_mock)
+
+    result = await onboarding_service.save_onboarding_progress_for_user(
+        "user_1",
+        wake_time="07:45",
+        bedtime="22:15",
+    )
+
+    update_kwargs = update_profile_mock.await_args.kwargs
+    assert "onboarding_status" not in update_kwargs
+    assert "onboarding_completed_at" not in update_kwargs
+    assert result["status"] == "ok"
+    assert (
+        result["context"]["onboarding_status"]
+        == onboarding_service.ONBOARDING_STATUS_COMPLETED
+    )
+
+
+@pytest.mark.asyncio
 async def test_complete_onboarding_for_user_requires_valid_inputs(monkeypatch):
     monkeypatch.setattr(onboarding_service.user_repo, "get_profile", AsyncMock(return_value=None))
 

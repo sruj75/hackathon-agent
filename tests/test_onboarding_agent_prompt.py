@@ -24,4 +24,6 @@ def test_onboarding_prompt_enforces_required_capture_flow():
 def test_onboarding_prompt_requires_tool_based_completion():
     assert "Call get_onboarding_context() at the beginning." in ONBOARDING_INSTRUCTION
     assert "Call complete_onboarding(wake_time, bedtime, playbook_json)" in ONBOARDING_INSTRUCTION
-    assert "can tap Continue to enter the main assistant." in ONBOARDING_INSTRUCTION
+    assert "Give exactly one short sendoff line." in ONBOARDING_INSTRUCTION
+    assert "Do not give an end-of-session summary." in ONBOARDING_INSTRUCTION
+    assert "tell user to tap Continue to enter the main assistant." in ONBOARDING_INSTRUCTION
