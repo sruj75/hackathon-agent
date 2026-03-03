@@ -1571,6 +1571,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     last_onboarding_state_persist_at = 0.0
     onboarding_state_persist_saved_count = 0
     onboarding_state_persist_skipped_count = 0
+    onboarding_completion_signal_sent = False
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
 
@@ -1671,25 +1672,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
         current_user_id.set(user_id)
         current_session_id.set(unified_session_id)
-
-        if onboarding_mode:
-            # Onboarding is a short, guided flow. Reusing in-memory ADK event history
-            # across reconnects can make Live setup brittle. Keep DB-backed state, but
-            # reset transient in-memory session history before each onboarding connect.
-            try:
-                await session_manager.service.delete_session(
-                    app_name=APP_NAME,
-                    user_id=user_id,
-                    session_id=unified_session_id,
-                )
-                logger.warning(
-                    "[LIVE-DIAG] cleared in-memory onboarding session history user=%s session=%s",
-                    user_id,
-                    unified_session_id,
-                )
-            except Exception:
-                # Session may not exist in memory yet; safe to ignore.
-                pass
 
         session = await session_manager.get_or_create_session(
             app_name=APP_NAME,
@@ -1827,6 +1809,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             nonlocal last_onboarding_state_persist_at
             nonlocal onboarding_state_persist_saved_count
             nonlocal onboarding_state_persist_skipped_count
+            nonlocal onboarding_completion_signal_sent
             live_event_count += 1
             has_audio_inline_part = False
             has_text_part = False
@@ -1941,6 +1924,43 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                                 await websocket.send_text(json.dumps(ui_event))
                             except (RuntimeError, WebSocketDisconnect):
                                 logger.warning("[MAIN-UI] WebSocket closed while sending UI event")
+                    if (
+                        onboarding_mode
+                        and not onboarding_completion_signal_sent
+                        and func_name == "complete_onboarding"
+                        and isinstance(response_data, dict)
+                    ):
+                        completion_payload = response_data.get("result")
+                        if not isinstance(completion_payload, dict):
+                            completion_payload = response_data
+                        completion_status = str(completion_payload.get("status") or "").lower()
+                        completion_onboarding_status = str(
+                            completion_payload.get("onboarding_status") or ""
+                        ).lower()
+                        completion_route_hint = str(completion_payload.get("route_hint") or "")
+                        completion_success = (
+                            completion_status in {"ok", "partial_success"}
+                            and completion_onboarding_status == ONBOARDING_STATUS_COMPLETED
+                            and completion_route_hint == "assistant"
+                        )
+                        if completion_success:
+                            onboarding_completion_signal_sent = True
+                            onboarding_complete_event = {
+                                "type": "onboarding_completed",
+                                "next_action": "show_done_screen",
+                                "route_hint": "assistant",
+                            }
+                            try:
+                                await websocket.send_text(json.dumps(onboarding_complete_event))
+                                logger.info(
+                                    "[onboarding] completion signal emitted user=%s session=%s",
+                                    user_id,
+                                    unified_session_id,
+                                )
+                            except (RuntimeError, WebSocketDisconnect):
+                                logger.info(
+                                    "WebSocket closed while sending onboarding completion event"
+                                )
 
             event_json = event.model_dump_json(exclude_none=True, by_alias=True)
             try:

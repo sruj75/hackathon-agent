@@ -38,6 +38,15 @@ def _normalize_str_list(value: Any) -> list[str]:
     return normalized
 
 
+def _normalize_optional_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
 def _normalize_playbook(
     playbook: dict[str, Any] | None,
     *,
@@ -123,6 +132,76 @@ async def get_onboarding_context_for_user(user_id: str) -> dict[str, Any]:
             },
         },
     }
+
+
+async def save_onboarding_progress_for_user(
+    user_id: str,
+    *,
+    wake_time: str | None = None,
+    bedtime: str | None = None,
+    timezone_name: str | None = None,
+    summary: str | None = None,
+    struggles: list[str] | None = None,
+    goals: list[str] | None = None,
+    communication_style: str | None = None,
+) -> dict[str, Any]:
+    profile = await user_repo.get_profile(user_id) or {}
+    updates: dict[str, Any] = {}
+
+    if wake_time is not None:
+        wake_time_clean = wake_time.strip()
+        if wake_time_clean and not _is_valid_hhmm(wake_time_clean):
+            raise ValueError("wake_time must be HH:MM in 24-hour format")
+        if wake_time_clean:
+            updates["wake_time"] = wake_time_clean
+
+    if bedtime is not None:
+        bedtime_clean = bedtime.strip()
+        if bedtime_clean and not _is_valid_hhmm(bedtime_clean):
+            raise ValueError("bedtime must be HH:MM in 24-hour format")
+        if bedtime_clean:
+            updates["bedtime"] = bedtime_clean
+
+    if timezone_name is not None:
+        resolved_timezone = _normalize_timezone(timezone_name)
+        if not resolved_timezone:
+            raise ValueError("timezone must be a valid IANA timezone")
+        updates["timezone"] = resolved_timezone
+
+    current_playbook = profile.get("playbook")
+    merged_playbook = dict(current_playbook) if isinstance(current_playbook, dict) else {}
+    now = datetime.now(timezone.utc)
+    schema_version = merged_playbook.get("schema_version")
+    if not isinstance(schema_version, str) or not schema_version.strip():
+        schema_version = "1.0"
+    merged_playbook["schema_version"] = schema_version
+    merged_playbook["created_at"] = merged_playbook.get("created_at") or now.isoformat()
+    merged_playbook["updated_at"] = now.isoformat()
+
+    normalized_summary = _normalize_optional_text(summary)
+    if normalized_summary is not None:
+        merged_playbook["summary"] = normalized_summary
+
+    if struggles is not None:
+        normalized_struggles = _normalize_str_list(struggles)
+        if normalized_struggles:
+            merged_playbook["struggles"] = normalized_struggles
+
+    if goals is not None:
+        normalized_goals = _normalize_str_list(goals)
+        if normalized_goals:
+            merged_playbook["goals"] = normalized_goals
+
+    normalized_style = _normalize_optional_text(communication_style)
+    if normalized_style is not None:
+        merged_playbook["communication_style"] = normalized_style
+
+    updates["playbook"] = merged_playbook
+    updates["onboarding_status"] = ONBOARDING_STATUS_PENDING
+    updates["onboarding_completed_at"] = None
+
+    await user_repo.update_profile(user_id, **updates)
+    return await get_onboarding_context_for_user(user_id)
 
 
 async def complete_onboarding_for_user(

@@ -125,3 +125,53 @@ async def test_complete_onboarding_rejects_incomplete_playbook(monkeypatch):
     finally:
         current_user_id.reset(user_token)
         current_user_timezone.reset(tz_token)
+
+
+@pytest.mark.asyncio
+async def test_save_onboarding_progress_calls_service(monkeypatch):
+    user_token = current_user_id.set("user_test")
+    try:
+        save_progress_mock = AsyncMock(
+            return_value={
+                "status": "ok",
+                "user_id": "user_test",
+                "context": {"onboarding_status": "pending"},
+            }
+        )
+        monkeypatch.setattr(
+            onboarding_tools,
+            "save_onboarding_progress_for_user",
+            save_progress_mock,
+        )
+
+        result = await onboarding_tools.save_onboarding_progress(
+            wake_time="07:30",
+            bedtime="22:15",
+            timezone="America/New_York",
+            summary="Needs structure and accountability",
+            struggles=["procrastination"],
+            goals=["consistent morning start"],
+            communication_style="direct",
+        )
+
+        assert result["status"] == "ok"
+        assert result["context"]["onboarding_status"] == "pending"
+        save_progress_mock.assert_awaited_once_with(
+            "user_test",
+            wake_time="07:30",
+            bedtime="22:15",
+            timezone_name="America/New_York",
+            summary="Needs structure and accountability",
+            struggles=["procrastination"],
+            goals=["consistent morning start"],
+            communication_style="direct",
+        )
+    finally:
+        current_user_id.reset(user_token)
+
+
+@pytest.mark.asyncio
+async def test_save_onboarding_progress_requires_user_context():
+    result = await onboarding_tools.save_onboarding_progress(summary="x")
+    assert result["status"] == "error"
+    assert result["error"] == "missing_user_context"
