@@ -133,6 +133,7 @@ LIFECYCLE_ACTIVE = "active"
 ENTRY_MODE_REACTIVE = "reactive"
 ENTRY_MODE_PROACTIVE = "proactive"
 ENTRY_MODE_POST_ONBOARDING = "post_onboarding"
+ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS = 1.5
 
 # ========================================
 # FastAPI App Setup
@@ -1566,6 +1567,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     audio_odd_chunks = 0
     first_audio_chunk_size: int | None = None
     first_audio_sent_at: float | None = None
+    onboarding_mode = False
+    last_onboarding_state_persist_at = 0.0
+    onboarding_state_persist_saved_count = 0
+    onboarding_state_persist_skipped_count = 0
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
 
@@ -1819,7 +1824,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         async def _process_downstream_event(event) -> bool:
             """Process one ADK event and forward to frontend. Returns False on closed socket."""
             nonlocal live_event_count
+            nonlocal last_onboarding_state_persist_at
+            nonlocal onboarding_state_persist_saved_count
+            nonlocal onboarding_state_persist_skipped_count
             live_event_count += 1
+            has_audio_inline_part = False
+            has_text_part = False
+            has_function_part = False
             if hasattr(event, "server_content") and event.server_content:
                 if (
                     hasattr(event.server_content, "input_transcription")
@@ -1841,6 +1852,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
             if event.content and event.content.parts:
                 for i, part in enumerate(event.content.parts):
+                    if getattr(part, "text", None):
+                        has_text_part = True
                     part_attrs = [
                         a
                         for a in ["text", "function_call", "function_response", "inline_data"]
@@ -1851,6 +1864,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
                     func_call = getattr(part, "function_call", None)
                     if func_call is not None:
+                        has_function_part = True
                         call_id = getattr(func_call, "id", None)
                         call_name = getattr(func_call, "name", "unknown")
                         call_args = getattr(func_call, "args", None)
@@ -1870,8 +1884,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                             )
 
                     func_resp = getattr(part, "function_response", None)
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data is not None:
+                        inline_mime_type = getattr(inline_data, "mime_type", None)
+                        if isinstance(inline_data, dict) and inline_mime_type is None:
+                            inline_mime_type = inline_data.get("mime_type")
+                        if isinstance(inline_mime_type, str) and inline_mime_type.startswith(
+                            "audio/"
+                        ):
+                            has_audio_inline_part = True
                     if func_resp is None:
                         continue
+                    has_function_part = True
                     func_name = getattr(func_resp, "name", "unknown")
                     func_resp_id = getattr(func_resp, "id", None)
                     response_data = getattr(func_resp, "response", None)
@@ -1925,6 +1949,39 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 logger.info("WebSocket connection closed, stopping downstream_task")
                 return False
 
+            should_persist_state = True
+            if onboarding_mode:
+                now_mono = time.monotonic()
+                has_turn_complete = bool(
+                    getattr(event, "turnComplete", False)
+                    or getattr(event, "turn_complete", False)
+                )
+                has_interrupted = bool(getattr(event, "interrupted", False))
+                has_server_transcription = bool(
+                    getattr(getattr(event, "server_content", None), "input_transcription", None)
+                    or getattr(getattr(event, "server_content", None), "output_transcription", None)
+                )
+                force_persist = (
+                    has_turn_complete
+                    or has_interrupted
+                    or has_server_transcription
+                    or has_function_part
+                    or has_text_part
+                )
+                if (
+                    has_audio_inline_part
+                    and not force_persist
+                    and now_mono - last_onboarding_state_persist_at
+                    < ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS
+                ):
+                    should_persist_state = False
+                    onboarding_state_persist_skipped_count += 1
+                else:
+                    last_onboarding_state_persist_at = now_mono
+
+            if not should_persist_state:
+                return True
+
             try:
                 assert unified_session_id is not None
                 assert user_id is not None
@@ -1933,6 +1990,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     session.state,
                     user_id=user_id,
                 )
+                if onboarding_mode:
+                    onboarding_state_persist_saved_count += 1
             except Exception as e:
                 logger.warning("Failed to persist session state: %s", e)
 
@@ -2040,6 +2099,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         except Exception as e:
             logger.error("Error in streaming: %s", e, exc_info=True)
     finally:
+        if onboarding_mode:
+            logger.warning(
+                "[LIVE-DIAG] onboarding_state_persist saved=%s skipped=%s interval_s=%s",
+                onboarding_state_persist_saved_count,
+                onboarding_state_persist_skipped_count,
+                ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS,
+            )
         logger.info("Closing live_request_queue")
         live_request_queue.close()
         set_ui_event_queue(None)
