@@ -6,6 +6,7 @@ This is the production FastAPI server that provides:
 - Health check endpoint
 """
 import asyncio
+from collections import deque
 import json
 import logging
 import os
@@ -134,6 +135,10 @@ ENTRY_MODE_REACTIVE = "reactive"
 ENTRY_MODE_PROACTIVE = "proactive"
 ENTRY_MODE_POST_ONBOARDING = "post_onboarding"
 ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS = 1.5
+ONBOARDING_SELF_HEAL_MAX_ATTEMPTS = 1
+LIVE_TIMELINE_MAX_EVENTS = 80
+LIVE_TIMELINE_ERROR_TAIL_EVENTS = 20
+STARTUP_POISON_ERROR_MARKERS = ("1007", "1011", "invalid argument", "internal error")
 
 # ========================================
 # FastAPI App Setup
@@ -200,6 +205,33 @@ def _is_live_transient_error(error: Exception) -> bool:
         or "unavailable" in message
         or "overloaded" in message
     )
+
+
+def _extract_live_error_code(error: Exception) -> str | None:
+    """Extract Gemini Live websocket error code when present."""
+    match = re.search(r"\b(1007|1011)\b", str(error))
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _is_onboarding_startup_poison(
+    *,
+    onboarding_mode: bool,
+    error: Exception,
+    live_event_count: int,
+) -> bool:
+    """
+    Startup poison means onboarding failed before first event with known payload/provider errors.
+    """
+    if not onboarding_mode:
+        return False
+    if live_event_count != 0:
+        return False
+    message = str(error).lower()
+    if not message:
+        return False
+    return any(marker in message for marker in STARTUP_POISON_ERROR_MARKERS)
 
 
 def _is_valid_hhmm(value: str | None) -> bool:
@@ -519,7 +551,7 @@ def _require_timezone(timezone_name: str | None, *, context: str) -> str:
 
 def _normalize_entry_mode(value: object) -> str:
     mode = str(value or "").strip().lower()
-    if mode in (ENTRY_MODE_PROACTIVE, ENTRY_MODE_POST_ONBOARDING):
+    if mode == ENTRY_MODE_PROACTIVE:
         return mode
     return ENTRY_MODE_REACTIVE
 
@@ -555,9 +587,6 @@ def _build_entry_context(
     entry_mode = _normalize_entry_mode(entry_mode_raw)
     if entry_mode == ENTRY_MODE_REACTIVE and source == "push":
         entry_mode = ENTRY_MODE_PROACTIVE
-    if trigger_type == ENTRY_MODE_POST_ONBOARDING:
-        entry_mode = ENTRY_MODE_POST_ONBOARDING
-
     context: dict[str, Any] = {
         "entry_mode": entry_mode,
         "source": source,
@@ -627,11 +656,11 @@ def _build_main_activation_prompt(entry_context: dict[str, Any]) -> str:
     event_id = entry_context.get("event_id")
     is_stale = bool(entry_context.get("is_stale"))
 
-    if entry_mode == ENTRY_MODE_POST_ONBOARDING:
+    if trigger_type == ENTRY_MODE_POST_ONBOARDING:
         return (
-            "Start main-agent mode after onboarding completion. Ground on the user's local time, "
-            "schedule, and onboarding profile context. If it's late, guide a wind-down routine; "
-            "otherwise, help plan the remainder of today with prioritized timeboxed essentials."
+            "Start post-onboarding handoff in reactive mode. Give one short congratulations line, "
+            "then ask what the user needs right now. Avoid proactive notification framing on this "
+            "first handoff turn."
         )
 
     if entry_mode == ENTRY_MODE_PROACTIVE and not is_stale:
@@ -1573,8 +1602,33 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     onboarding_state_persist_skipped_count = 0
     onboarding_completion_signal_sent = False
     onboarding_completion_signal_pending = False
+    startup_poison_detected_count = 0
+    startup_self_heal_attempted_count = 0
+    startup_self_heal_succeeded_count = 0
+    live_timeline: deque[dict[str, Any]] = deque(maxlen=LIVE_TIMELINE_MAX_EVENTS)
     set_ui_event_queue(ui_event_queue)
     run_config = AgentRuntime.get_realtime_run_config()
+
+    def _record_live_timeline(event_name: str, **payload: Any) -> None:
+        entry: dict[str, Any] = {
+            "t_ms": int((time.monotonic() - ws_opened_at) * 1000),
+            "event": event_name,
+        }
+        for key, value in payload.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                entry[key] = value
+            else:
+                entry[key] = str(value)
+        live_timeline.append(entry)
+
+    def _log_live_timeline_tail(reason: str) -> None:
+        if not live_timeline:
+            return
+        logger.error(
+            "[LIVE-DIAG] timeline_tail reason=%s tail=%s",
+            reason,
+            list(live_timeline)[-LIVE_TIMELINE_ERROR_TAIL_EVENTS:],
+        )
 
     try:
         first_message = await asyncio.wait_for(websocket.receive(), timeout=20.0)
@@ -1715,12 +1769,21 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             if onboarding_mode
             else _build_main_activation_prompt(entry_context)
         )
-        activation_message = types.Content(
-            role="user",
-            parts=[types.Part(text=activation_prompt)],
-        )
-        live_request_queue.send_content(activation_message)
-        logger.info("[WS-INIT] Sent activation message")
+
+        def _seed_activation_message() -> None:
+            activation_message = types.Content(
+                role="user",
+                parts=[types.Part(text=activation_prompt)],
+            )
+            live_request_queue.send_content(activation_message)
+            _record_live_timeline(
+                "activation_seed",
+                onboarding_mode=onboarding_mode,
+                session_id=unified_session_id,
+            )
+            logger.info("[WS-INIT] Sent activation message")
+
+        _seed_activation_message()
 
         async def upstream_task() -> None:
             """Receives messages from WebSocket and sends to LiveRequestQueue."""
@@ -1768,6 +1831,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                                 chunk_size,
                                 int((time.monotonic() - ws_opened_at) * 1000),
                             )
+                        _record_live_timeline(
+                            "audio_chunk",
+                            idx=audio_chunk_count,
+                            size=chunk_size,
+                        )
                         audio_blob = types.Blob(
                             mime_type="audio/pcm;rate=16000",
                             data=audio_data,
@@ -1821,6 +1889,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     hasattr(event.server_content, "input_transcription")
                     and event.server_content.input_transcription
                 ):
+                    _record_live_timeline(
+                        "input_transcription",
+                        text_len=len(event.server_content.input_transcription.text or ""),
+                    )
                     logger.info(
                         "[TRANSCRIPTION-INPUT] User: %s",
                         event.server_content.input_transcription.text,
@@ -1830,6 +1902,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     hasattr(event.server_content, "output_transcription")
                     and event.server_content.output_transcription
                 ):
+                    _record_live_timeline(
+                        "output_transcription",
+                        text_len=len(event.server_content.output_transcription.text or ""),
+                    )
                     logger.info(
                         "[TRANSCRIPTION-OUTPUT] Agent: %s",
                         event.server_content.output_transcription.text,
@@ -1859,6 +1935,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                             call_name,
                             call_id,
                             arg_keys,
+                        )
+                        _record_live_timeline(
+                            "function_call",
+                            call_name=call_name,
+                            call_id=call_id,
                         )
                         if isinstance(call_id, str) and call_id:
                             seen_function_call_ids[call_id] = call_name
@@ -1895,6 +1976,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                     )
                     if isinstance(func_resp_id, str) and func_resp_id:
                         seen_function_response_ids.add(func_resp_id)
+                        _record_live_timeline(
+                            "function_response",
+                            response_name=func_name,
+                            response_id=func_resp_id,
+                        )
                         if func_resp_id in seen_function_call_ids:
                             logger.info(
                                 "[LIVE-DIAG] function_response matched_call id=%s call_name=%s response_name=%s",
@@ -2001,6 +2087,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 or getattr(event, "turn_complete", False)
                 or payload_turn_complete
             )
+            if bool(getattr(event, "interrupted", False)):
+                _record_live_timeline("interrupted")
+            if has_turn_complete:
+                _record_live_timeline("turn_complete")
             if (
                 onboarding_mode
                 and onboarding_completion_signal_pending
@@ -2070,6 +2160,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
         async def downstream_task() -> None:
             """Receives Events from run_live() and sends to WebSocket."""
+            nonlocal session
+            nonlocal live_request_queue
+            nonlocal startup_poison_detected_count
+            nonlocal startup_self_heal_attempted_count
+            nonlocal startup_self_heal_succeeded_count
             logger.debug("downstream_task started")
             max_retries = 2
             selected_runner = onboarding_runner if onboarding_mode else main_runner
@@ -2085,6 +2180,101 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 )
             logger.info("[LIVE] Attempting run_live with conversation model: %s", model_name)
 
+            async def _persist_bootstrap_state_checkpoint() -> None:
+                if not onboarding_mode:
+                    return
+                try:
+                    assert unified_session_id is not None
+                    assert user_id is not None
+                    await session_manager.save_agent_session_to_db(
+                        unified_session_id,
+                        session.state,
+                        user_id=user_id,
+                    )
+                    logger.warning(
+                        "[LIVE-DIAG] onboarding bootstrap checkpoint persisted user=%s session=%s",
+                        user_id,
+                        unified_session_id,
+                    )
+                except Exception as checkpoint_error:
+                    logger.warning(
+                        "[LIVE-DIAG] onboarding bootstrap checkpoint failed user=%s session=%s error=%s",
+                        user_id,
+                        unified_session_id,
+                        checkpoint_error,
+                    )
+
+            async def _self_heal_onboarding_startup_poison() -> None:
+                nonlocal session
+                nonlocal live_request_queue
+                nonlocal startup_self_heal_attempted_count
+                assert onboarding_mode
+                assert user_id is not None
+                assert unified_session_id is not None
+                startup_self_heal_attempted_count += 1
+                logger.warning(
+                    "[LIVE] startup poison detected, self-healing onboarding session user=%s session=%s",
+                    user_id,
+                    unified_session_id,
+                )
+                try:
+                    await session_manager.service.delete_session(
+                        app_name=APP_NAME,
+                        user_id=user_id,
+                        session_id=unified_session_id,
+                    )
+                    logger.warning(
+                        "[LIVE-DIAG] onboarding self_heal cleared in-memory session user=%s session=%s",
+                        user_id,
+                        unified_session_id,
+                    )
+                except Exception as delete_error:
+                    logger.warning(
+                        "[LIVE-DIAG] onboarding self_heal clear_session failed user=%s session=%s error=%s",
+                        user_id,
+                        unified_session_id,
+                        delete_error,
+                    )
+
+                session = await session_manager.get_or_create_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=unified_session_id,
+                )
+                session.state["trigger_type"] = "onboarding"
+                session.state["agent_mode"] = "onboarding"
+                session.state["lifecycle_state"] = lifecycle_state
+                session.state["entry_mode"] = str(
+                    entry_context.get("entry_mode") or ENTRY_MODE_REACTIVE
+                )
+                session.state["entry_context"] = entry_context
+                if resolved_timezone:
+                    session.state["user_timezone"] = resolved_timezone
+
+                try:
+                    await session_manager.save_agent_session_to_db(
+                        unified_session_id,
+                        session.state,
+                        user_id=user_id,
+                    )
+                except Exception as rehydrate_save_error:
+                    logger.warning(
+                        "[LIVE-DIAG] onboarding self_heal checkpoint save failed user=%s session=%s error=%s",
+                        user_id,
+                        unified_session_id,
+                        rehydrate_save_error,
+                    )
+
+                live_request_queue = LiveRequestQueue()
+                _seed_activation_message()
+                _record_live_timeline(
+                    "self_heal",
+                    user_id=user_id,
+                    session_id=unified_session_id,
+                )
+
+            await _persist_bootstrap_state_checkpoint()
+
             for attempt in range(1, max_retries + 1):
                 try:
                     assert user_id is not None
@@ -2095,11 +2285,54 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         live_request_queue=live_request_queue,
                         run_config=run_config,
                     ):
+                        if (
+                            startup_self_heal_attempted_count > 0
+                            and startup_self_heal_succeeded_count == 0
+                        ):
+                            startup_self_heal_succeeded_count += 1
+                            logger.warning(
+                                "[LIVE-DIAG] onboarding self_heal succeeded user=%s session=%s",
+                                user_id,
+                                unified_session_id,
+                            )
                         should_continue = await _process_downstream_event(event)
                         if not should_continue:
                             return
                     return
                 except Exception as e:
+                    error_code = _extract_live_error_code(e)
+                    startup_poison = _is_onboarding_startup_poison(
+                        onboarding_mode=onboarding_mode,
+                        error=e,
+                        live_event_count=live_event_count,
+                    )
+                    if startup_poison:
+                        startup_poison_detected_count += 1
+                    _record_live_timeline(
+                        "error",
+                        attempt=attempt,
+                        error_code=error_code,
+                        startup_poison=startup_poison,
+                        message=str(e)[:220],
+                    )
+                    logger.warning(
+                        "[LIVE-DIAG] startup_poison=%s onboarding_mode=%s events_seen=%s attempt=%s error_code=%s",
+                        startup_poison,
+                        onboarding_mode,
+                        live_event_count,
+                        attempt,
+                        error_code,
+                    )
+                    _log_live_timeline_tail("downstream_exception")
+
+                    if (
+                        startup_poison
+                        and startup_self_heal_attempted_count
+                        < ONBOARDING_SELF_HEAL_MAX_ATTEMPTS
+                    ):
+                        await _self_heal_onboarding_startup_poison()
+                        continue
+
                     is_last_attempt = attempt == max_retries
                     if _is_live_transient_error(e) and not is_last_attempt:
                         backoff_seconds = 2 ** (attempt - 1)
@@ -2168,6 +2401,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         except WebSocketDisconnect:
             logger.info("Client disconnected")
         except Exception as e:
+            _record_live_timeline(
+                "error",
+                error_code=_extract_live_error_code(e),
+                startup_poison=False,
+                message=str(e)[:220],
+            )
+            _log_live_timeline_tail("websocket_endpoint_exception")
             logger.error("Error in streaming: %s", e, exc_info=True)
     finally:
         logger.warning(
@@ -2176,6 +2416,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             onboarding_state_persist_saved_count,
             onboarding_state_persist_skipped_count,
             ONBOARDING_STATE_PERSIST_INTERVAL_SECONDS,
+        )
+        logger.warning(
+            "[LIVE-DIAG] startup_recovery mode=%s startup_poison_detected=%s self_heal_attempted=%s self_heal_succeeded=%s",
+            "onboarding" if onboarding_mode else "main",
+            startup_poison_detected_count,
+            startup_self_heal_attempted_count,
+            startup_self_heal_succeeded_count,
         )
         logger.info("Closing live_request_queue")
         live_request_queue.close()

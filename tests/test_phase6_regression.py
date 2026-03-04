@@ -5,6 +5,7 @@ Ensures WebSocket session resumption/init handshake and generative UI
 forwarding still work while keeping older behavior intact.
 """
 import json
+import copy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -130,6 +131,32 @@ class TestPhase6WebSocketFlow:
             )
             == fallback
         )
+
+    def test_post_onboarding_entry_mode_is_normalized_to_reactive(self):
+        context = main._build_entry_context(
+            {
+                "entry_mode": "post_onboarding",
+                "source": "post_onboarding",
+                "trigger_type": "post_onboarding",
+            },
+            default_trigger_type="post_onboarding",
+            resolved_timezone="UTC",
+        )
+        assert context["entry_mode"] == main.ENTRY_MODE_REACTIVE
+        assert context["trigger_type"] == "post_onboarding"
+        assert context["source"] == "post_onboarding"
+
+    def test_main_activation_prompt_for_post_onboarding_uses_reactive_handoff(self):
+        prompt = main._build_main_activation_prompt(
+            {
+                "entry_mode": main.ENTRY_MODE_REACTIVE,
+                "trigger_type": "post_onboarding",
+                "event_id": None,
+                "is_stale": False,
+            }
+        )
+        assert "reactive mode" in prompt.lower()
+        assert "proactive notification framing" in prompt.lower()
 
     @pytest.mark.asyncio
     async def test_init_handshake_stores_trigger_type(self, monkeypatch):
@@ -383,7 +410,7 @@ class TestPhase6WebSocketFlow:
 
         # Audio chunks should still be forwarded, but DB writes should be throttled.
         assert len(ws.sent_texts) >= 5
-        assert 1 <= save_session_mock.await_count <= 2
+        assert 2 <= save_session_mock.await_count <= 3
 
     @pytest.mark.asyncio
     async def test_main_audio_events_throttle_state_persistence(self, monkeypatch):
@@ -454,6 +481,236 @@ class TestPhase6WebSocketFlow:
         # Main mode should use the same state-persist throttling as onboarding.
         assert len(ws.sent_texts) >= 5
         assert 1 <= save_session_mock.await_count <= 2
+
+    @pytest.mark.asyncio
+    async def test_onboarding_startup_poison_self_heals_and_retries_once(
+        self, monkeypatch
+    ):
+        fake_session_initial = SimpleNamespace(state={})
+        fake_session_rehydrated = SimpleNamespace(state={})
+        delete_session_mock = AsyncMock(return_value=None)
+        save_session_mock = AsyncMock(return_value=True)
+        run_attempts = {"count": 0}
+        get_or_create_calls = {"count": 0}
+
+        async def fake_get_or_create_session(**_kwargs):
+            get_or_create_calls["count"] += 1
+            if get_or_create_calls["count"] == 1:
+                return fake_session_initial
+            return fake_session_rehydrated
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _FakeLiveRequestQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_realtime_run_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(PENDING_PROFILE))
+        )
+        monkeypatch.setattr(
+            main.session_manager,
+            "get_or_create_session",
+            fake_get_or_create_session,
+        )
+        monkeypatch.setattr(main.session_manager, "save_agent_session_to_db", save_session_mock)
+        monkeypatch.setattr(main.session_manager.service, "delete_session", delete_session_mock)
+
+        async def fake_onboarding_run_live(**_kwargs):
+            run_attempts["count"] += 1
+            if run_attempts["count"] == 1:
+                raise Exception("1007 None. Request contains an invalid argument.")
+            yield _FakeEvent(payload={"turnComplete": True})
+
+        async def fail_if_main_runner_used(**_kwargs):
+            raise AssertionError("main runner should not be used for onboarding")
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.onboarding_runner, "run_live", fake_onboarding_run_live)
+        monkeypatch.setattr(main.main_runner, "run_live", fail_if_main_runner_used)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
+
+        ws = _FakeWebSocket(
+            [
+                {"text": json.dumps({"type": "init", "access_token": "jwt_test"})},
+                {"type": "websocket.disconnect"},
+            ]
+        )
+
+        await main.websocket_endpoint(ws, "client_random_session")
+
+        assert run_attempts["count"] == 2
+        delete_session_mock.assert_awaited_once()
+        assert len(ws.sent_texts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_onboarding_startup_poison_self_heal_runs_at_most_once(
+        self, monkeypatch
+    ):
+        fake_session = SimpleNamespace(state={})
+        delete_session_mock = AsyncMock(return_value=None)
+        run_attempts = {"count": 0}
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _FakeLiveRequestQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_realtime_run_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(PENDING_PROFILE))
+        )
+        monkeypatch.setattr(
+            main.session_manager, "get_or_create_session", AsyncMock(return_value=fake_session)
+        )
+        monkeypatch.setattr(
+            main.session_manager, "save_agent_session_to_db", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(main.session_manager.service, "delete_session", delete_session_mock)
+
+        async def fake_onboarding_run_live(**_kwargs):
+            run_attempts["count"] += 1
+            raise Exception("1011 None. Internal error occurred.")
+            if False:  # pragma: no cover
+                yield None
+
+        async def fail_if_main_runner_used(**_kwargs):
+            raise AssertionError("main runner should not be used for onboarding")
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.onboarding_runner, "run_live", fake_onboarding_run_live)
+        monkeypatch.setattr(main.main_runner, "run_live", fail_if_main_runner_used)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
+
+        ws = _FakeWebSocket(
+            [
+                {"text": json.dumps({"type": "init", "access_token": "jwt_test"})},
+                {"type": "websocket.disconnect"},
+            ]
+        )
+
+        await main.websocket_endpoint(ws, "client_random_session")
+
+        assert run_attempts["count"] == 2
+        delete_session_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_onboarding_self_heal_preserves_db_state(self, monkeypatch):
+        persisted_state_snapshot: dict = {}
+        all_saved_states: list[dict] = []
+        rehydrated_sessions: list[SimpleNamespace] = []
+        get_or_create_calls = {"count": 0}
+        run_attempts = {"count": 0}
+        delete_session_mock = AsyncMock(return_value=None)
+        initial_state = {
+            "wake_time": "07:15",
+            "bedtime": "22:45",
+            "playbook": {"summary": "User has ADHD struggles"},
+        }
+        fake_session_initial = SimpleNamespace(state=copy.deepcopy(initial_state))
+
+        async def fake_get_or_create_session(**_kwargs):
+            get_or_create_calls["count"] += 1
+            if get_or_create_calls["count"] == 1:
+                return fake_session_initial
+            rehydrated = SimpleNamespace(state=copy.deepcopy(persisted_state_snapshot))
+            rehydrated_sessions.append(rehydrated)
+            return rehydrated
+
+        async def fake_save_session(session_id, state, user_id=None):
+            del session_id, user_id
+            state_copy = copy.deepcopy(state)
+            all_saved_states.append(state_copy)
+            if not persisted_state_snapshot:
+                persisted_state_snapshot.update(state_copy)
+            return True
+
+        monkeypatch.setattr(main, "LiveRequestQueue", _FakeLiveRequestQueue)
+        monkeypatch.setattr(main.types, "Content", _FakeContent)
+        monkeypatch.setattr(main.types, "Part", _FakePart)
+        monkeypatch.setattr(main.types, "Blob", _FakeBlob)
+        monkeypatch.setattr(
+            main.AgentRuntime,
+            "get_realtime_run_config",
+            staticmethod(lambda: object()),
+        )
+        monkeypatch.setattr(
+            main.user_repo, "get_profile", AsyncMock(return_value=dict(PENDING_PROFILE))
+        )
+        monkeypatch.setattr(
+            main.session_manager,
+            "get_or_create_session",
+            fake_get_or_create_session,
+        )
+        monkeypatch.setattr(main.session_manager, "save_agent_session_to_db", fake_save_session)
+        monkeypatch.setattr(main.session_manager.service, "delete_session", delete_session_mock)
+
+        async def fake_onboarding_run_live(**_kwargs):
+            run_attempts["count"] += 1
+            if run_attempts["count"] == 1:
+                raise Exception("1007 None. Request contains an invalid argument.")
+            yield _FakeEvent(payload={"turnComplete": True})
+
+        async def fail_if_main_runner_used(**_kwargs):
+            raise AssertionError("main runner should not be used for onboarding")
+            if False:  # pragma: no cover
+                yield None
+
+        monkeypatch.setattr(main.onboarding_runner, "run_live", fake_onboarding_run_live)
+        monkeypatch.setattr(main.main_runner, "run_live", fail_if_main_runner_used)
+        monkeypatch.setattr(
+            main,
+            "verify_supabase_jwt",
+            AsyncMock(
+                return_value=AuthUser(
+                    user_id="user_test", email="test@example.com", claims={}
+                )
+            ),
+        )
+
+        ws = _FakeWebSocket(
+            [
+                {"text": json.dumps({"type": "init", "access_token": "jwt_test"})},
+                {"type": "websocket.disconnect"},
+            ]
+        )
+
+        await main.websocket_endpoint(ws, "client_random_session")
+
+        assert run_attempts["count"] == 2
+        delete_session_mock.assert_awaited_once()
+        assert persisted_state_snapshot["wake_time"] == "07:15"
+        assert persisted_state_snapshot["bedtime"] == "22:45"
+        assert persisted_state_snapshot["playbook"]["summary"] == "User has ADHD struggles"
+        assert len(rehydrated_sessions) == 1
+        assert rehydrated_sessions[0].state["wake_time"] == "07:15"
+        assert any(
+            saved_state.get("wake_time") == "07:15" for saved_state in all_saved_states
+        )
 
     @pytest.mark.asyncio
     async def test_onboarding_completion_emits_done_screen_event(self, monkeypatch):
